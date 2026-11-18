@@ -15,7 +15,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 # ================= CẤU HÌNH TRANG =================
-st.set_page_config(page_title="THACO Smart Meeting & AI Biên Bản - Lưu Pro", page_icon="🚗", layout="wide")
+st.set_page_config(page_title="Mr Lưu Smart Meeting & AI Biên Bản - Lưu Pro", page_icon="🚗", layout="wide")
 
 VN_TZ = timezone(timedelta(hours=7))
 
@@ -42,7 +42,7 @@ defaults = {
     "is_synced": False,
     "bbh_meta": {
         "so_bbh": "…/2026/BBH – Phòng QLCL KCN",
-        "ve_viec": "Đánh giá chất lượng xe và giải quyết các vấn đề kỹ thuật sau bán hàng",
+        "ve_viec": "....",
         "thoi_gian": datetime.now(VN_TZ).strftime("%H:%M ngày %d/%m/%Y"),
         "dia_diem": "Họp trực tuyến qua Microsoft Teams / Phòng họp QLCL KCN",
         "ket_luan_chung": "Trên đây là các thống nhất, chỉ đạo và triển khai trong cuộc họp, đề nghị các phòng ban, các Nhà máy triển khai thực hiện theo tiến độ, Phòng QLCL KCN làm đầu mối tổng hợp, theo dõi và báo cáo tiến độ thực hiện theo định kỳ."
@@ -50,12 +50,12 @@ defaults = {
     "recap_rows": [
         {
             "tt": "1",
-            "van_de": "Đối với 04 báo cáo khiếu nại chưa có Báo cáo kỹ thuật từ BJM (chỉ có thông tin nhanh)",
-            "noi_dung_thao_luan": "BJM xác nhận xe của khách hàng cuối đang vận hành ở xa (không vào xưởng) nên chưa thể chụp hình và lập báo cáo kỹ thuật.",
-            "cong_viec_tiep_theo": "BJM sẽ theo dõi tình hình và cập nhật thông tin cho THACO trong tuần tiếp theo.",
-            "trach_nhiem": "BJM",
+            "van_de": "...",
+            "noi_dung_thao_luan": "..",
+            "cong_viec_tiep_theo": "..",
+            "trach_nhiem": "..",
             "phoi_hop": "-",
-            "hoan_thanh": "20/11/2026"
+            "hoan_thanh": "..."
         }
     ]
 }
