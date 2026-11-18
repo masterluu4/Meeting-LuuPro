@@ -14,7 +14,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
 # ================= CẤU HÌNH TRANG =================
-st.set_page_config(page_title="THACO Smart Meeting & AI Biên Bản", page_icon="🚗", layout="wide")
+st.set_page_config(page_title="THACO Smart Meeting & AI Biên Bản - Lưu Pro", page_icon="🚗", layout="wide")
 
 DEFAULT_PERSONNEL = [
     {"ho_ten": "Ông Nguyễn Thiện Đức", "chuc_danh": "PGĐ.QLCL Ô tô & LKPT KCN", "phong_ban": "Phòng QLCL KCN"},
@@ -31,6 +31,11 @@ defaults = {
     "glossary": {},
     "tm": {},
     "personnel": DEFAULT_PERSONNEL,
+    "selected_attendees": [],        # Danh sách nhân sự tham gia được chọn ở Bước 2
+    "extra_attendees_str": "",       # Nhân sự / Đối tác bổ sung ngoài danh bạ
+    "template_docx_bytes": None,     # Lưu trữ file Word BBH mẫu tải lên từ Bước 2
+    "template_docx_name": "",        # Tên file Word BBH mẫu
+    "template_structure_hint": "",   # Cấu trúc trích xuất từ file BBH mẫu để AI hiểu form
     "is_synced": False,
     "bbh_meta": {
         "so_bbh": "…/2026/BBH – Phòng QLCL KCN",
@@ -54,6 +59,42 @@ defaults = {
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# ================= GIAO DIỆN CSS COCKPIT THACO EXECUTIVE =================
+st.markdown("""
+<style>
+    .block-container { padding-top: 1.1rem !important; padding-bottom: 1rem !important; max-width: 98% !important; }
+    
+    .thaco-header {
+        background: linear-gradient(90deg, #002B5B 0%, #004B8D 100%);
+        color: white; padding: 12px 22px; border-radius: 10px;
+        display: flex; justify-content: space-between; align-items: center;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.12); margin-bottom: 12px;
+        flex-wrap: wrap; gap: 10px;
+    }
+    .thaco-title { font-size: 19px; font-weight: 700; letter-spacing: 0.4px; margin: 0; }
+    .thaco-badges { display: flex; gap: 8px; font-size: 12.5px; flex-wrap: wrap; }
+    .thaco-badge {
+        background: rgba(255,255,255,0.16); padding: 4px 12px;
+        border-radius: 20px; border: 1px solid rgba(255,255,255,0.28); font-weight: 600;
+    }
+
+    .stTabs [data-baseweb="tab-list"] { gap: 8px; background-color: #f1f5f9; padding: 6px; border-radius: 10px; }
+    .stTabs [data-baseweb="tab"] {
+        height: 40px; border-radius: 8px; padding: 0 16px;
+        font-weight: 600; color: #334155; background-color: transparent;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #003366 !important; color: #ffffff !important;
+        box-shadow: 0 2px 6px rgba(0,51,102,0.25);
+    }
+
+    .step-card {
+        background: #f8fafc; border: 1px solid #e2e8f0; border-left: 4px solid #003366;
+        border-radius: 8px; padding: 12px 16px; margin-bottom: 12px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ================= HÀM LÀM SẠCH API KEY & URL =================
 def clean_api_key(raw_key):
@@ -145,9 +186,37 @@ def save_personnel_to_sheets(raw_url, personnel_list):
         if res.status_code == 200 and res.json().get("status") == "ok":
             st.session_state.personnel = clean_list
             return True, f"✅ Đã lưu {len(clean_list)} nhân sự lên tab Personnel của Google Sheets!"
-        return False, f"❌ Lỗi từ Apps Script (Hãy chắc chắn anh đã cập nhật Code.gs mới): {res.text}"
+        return False, f"❌ Lỗi từ Apps Script: {res.text}"
     except Exception as e:
         return False, f"❌ Lỗi kết nối: {e}"
+
+# ================= HÀM ĐỌC CẤU TRÚC FILE WORD MẪU ĐỂ ĐƯA VÀO AI RECAP =================
+def inspect_docx_template(file_bytes):
+    """
+    Đọc cấu trúc thực tế của file Word BBH mẫu (các đoạn tiêu đề, cấu trúc bảng, dòng ví dụ mẫu)
+    để truyền cho AI Recap hiểu chính xác form mẫu và văn phong của đơn vị.
+    """
+    try:
+        doc = Document(io.BytesIO(file_bytes))
+        paragraphs_info = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+        tables_info = []
+        for idx, tbl in enumerate(doc.tables, 1):
+            if len(tbl.rows) > 0:
+                headers = [c.text.strip().replace("\n", " ") for c in tbl.rows[0].cells]
+                sample_row = [c.text.strip().replace("\n", " ") for c in tbl.rows[1].cells] if len(tbl.rows) > 1 else []
+                tables_info.append({
+                    "bang_so": idx,
+                    "so_cot": len(tbl.columns),
+                    "tieu_de_cot": headers,
+                    "dong_mau_tham_khao": sample_row
+                })
+        summary = {
+            "cac_muc_van_ban_trong_form": paragraphs_info[:12],
+            "cau_truc_cac_bang_trong_form": tables_info
+        }
+        return json.dumps(summary, ensure_ascii=False, indent=2)
+    except Exception as e:
+        return f"Không đọc được chi tiết cấu trúc mẫu: {e}"
 
 # ================= HÀM QUÉT MODEL & TỰ ĐỘNG FALLBACK KHI LỖI 429 =================
 @st.cache_data(ttl=300, show_spinner=False)
@@ -324,7 +393,7 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, raw_key, model_name
 
         direction = "tiếng Anh sang tiếng Việt" if mode == "Anh -> Việt" else "tiếng Việt sang tiếng Anh"
         glossary_instruction = f"BẮT BUỘC dùng đúng thuật ngữ THACO sau: {json.dumps(matched, ensure_ascii=False)}. " if matched else ""
-        personnel_context = f"Danh sách nhân sự/phòng ban THACO để tham chiếu khi dịch tên/chức vụ: {json.dumps(st.session_state.personnel, ensure_ascii=False)}. "
+        personnel_context = f"Danh sách nhân sự/phòng ban THACO để tham chiếu: {json.dumps(st.session_state.personnel, ensure_ascii=False)}. "
 
         try:
             genai.configure(api_key=api_key)
@@ -361,7 +430,6 @@ def set_cell_border(cell):
     tcPr.append(tcBorders)
 
 def build_attendance_matrix(selected_personnel):
-    """Gom nhóm nhân sự theo Phòng ban/Đơn vị để đổ vào Bảng II. Thành phần tham dự"""
     grouped = {}
     for p in selected_personnel:
         dept = p.get("phong_ban", "").strip() or "Đơn vị tham dự"
@@ -407,23 +475,20 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows, selected
         elif txt.startswith("Trên đây là các thống nhất"):
             p.text = meta["ket_luan_chung"]
 
-    # 3. Cập nhật Bảng II. Thành phần tham dự (Bảng thứ 2 - index 1 trong mẫu BBH THACO)
+    # 3. Cập nhật Bảng II. Thành phần tham dự (Bảng thứ 2 - index 1)
     if update_attendance_table and selected_personnel and len(doc.tables) >= 2:
         att_tbl = doc.tables[1]
         depts, matrix = build_attendance_matrix(selected_personnel)
         if depts:
-            # Xóa các dòng cũ
             while len(att_tbl.rows) > 0:
                 att_tbl._tbl.remove(att_tbl.rows[0]._tr)
             num_cols = len(att_tbl.columns)
-            # Dòng tiêu đề Phòng ban
             hdr_cells = att_tbl.add_row().cells
             for c_i in range(num_cols):
                 hdr_cells[c_i].text = depts[c_i] if c_i < len(depts) else ""
                 for run in hdr_cells[c_i].paragraphs[0].runs:
                     run.bold = True
                 set_cell_border(hdr_cells[c_i])
-            # Các dòng nhân sự
             for r_vals in matrix:
                 r_cells = att_tbl.add_row().cells
                 for c_i in range(num_cols):
@@ -585,11 +650,6 @@ with st.sidebar:
         else:
             st.error(msg)
 
-    st.caption(
-        f"📊 Kho dữ liệu chung: **{len(st.session_state.glossary)}** thuật ngữ | "
-        f"**{len(st.session_state.tm)}** câu TM | **{len(st.session_state.personnel)}** nhân sự"
-    )
-
     st.divider()
     st.subheader("🌐 Chế độ Ngôn ngữ Họp")
     trans_mode = st.radio(
@@ -626,271 +686,294 @@ with st.sidebar:
             else:
                 st.warning("Vui lòng nhập đủ Từ gốc, Từ dịch và Link Web App URL.")
 
-# ================= GIAO DIỆN CHÍNH =================
-st.title("Hệ Thống Trợ Lý Họp, Dịch Thuật Real-time & Xuất BBH - Lưu Pro")
+# ================= THANH HEADER EXECUTIVE CHUẨN THACO AUTO =================
+st.markdown(f"""
+<div class="thaco-header">
+    <div class="thaco-title">🚗 HỆ THỐNG TRỢ LÝ HỌP, DỊCH THUẬT REAL-TIME & XUẤT BBH — LƯU PRO</div>
+    <div class="thaco-badges">
+        <span class="thaco-badge">🤖 Recap: {selected_recap_model}</span>
+        <span class="thaco-badge">📖 Glossary: {len(st.session_state.glossary)}</span>
+        <span class="thaco-badge">🧠 TM: {len(st.session_state.tm)}</span>
+        <span class="thaco-badge">👥 Nhân sự: {len(st.session_state.personnel)}</span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "🎙️ Bước 1: Thu Âm VB-Cable & Phụ Đề (Có Gắn Thẻ Nhân Sự)",
-    "🧠 Bước 2: AI Recap (Tự Động Trích Xuất Nhân Sự & Đơn Vị)",
+    "🎙️ Bước 1: Cockpit Thu Âm & Dịch Real-time",
+    "🧠 Bước 2: Thiết Lập Nhân Sự, Mẫu BBH & AI Recap",
     "📄 Bước 3: Xuất Biên Bản Word Trình Ký",
     "📚 Quản Trị Nhân Sự, TM & Glossary (Google Sheets)"
 ])
 
-# ----------------- TAB 1: THU ÂM VB-CABLE & PHỤ ĐỀ CÓ HIỂN THỊ NHÂN SỰ -----------------
+# ----------------- TAB 1: COCKPIT THU ÂM VB-CABLE & BÀN DỊCH SONG SONG -----------------
 with tab1:
-    st.info(
-        "🔊 **Tích hợp Nhận diện Nhân sự & Chức danh trên Phụ đề:** "
-        "Anh có thể chọn nhanh **Người đang phát biểu** ở thanh điều khiển thu âm để gắn nhãn `[Họ tên – Chức danh (Phòng ban)]` vào đầu mỗi câu phụ đề, "
-        "hoặc khi câu nói nhắc đến tên nhân sự có trong Google Sheets, hệ thống sẽ tự động hiển thị thẻ Chức danh - Phòng ban ngay trên màn hình."
-    )
+    col_left_cockpit, col_right_cockpit = st.columns([1.25, 1], gap="medium")
 
-    speech_lang = "en-US" if trans_mode == "Anh -> Việt" else "vi-VN"
-    glossary_json_str = json.dumps(st.session_state.glossary, ensure_ascii=False)
-    tm_json_str = json.dumps(st.session_state.tm, ensure_ascii=False)
-    personnel_json_str = json.dumps(st.session_state.personnel, ensure_ascii=False)
+    with col_left_cockpit:
+        speech_lang = "en-US" if trans_mode == "Anh -> Việt" else "vi-VN"
+        glossary_json_str = json.dumps(st.session_state.glossary, ensure_ascii=False)
+        tm_json_str = json.dumps(st.session_state.tm, ensure_ascii=False)
+        personnel_json_str = json.dumps(st.session_state.personnel, ensure_ascii=False)
 
-    web_audio_component = f"""
-    <div style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; padding:16px; font-family:sans-serif;">
-      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
-        <select id="audioSource" style="flex:1; min-width:220px; padding:8px; border-radius:6px; border:1px solid #94a3b8; font-weight:600;"></select>
-        <select id="speakerSelect" style="flex:1; min-width:240px; padding:8px; border-radius:6px; border:1px solid #0284c7; background:#f0f9ff; font-weight:600; color:#0369a1;">
-          <option value="">👤 Người đang phát biểu: Tự động / Chung</option>
-        </select>
-        <button id="btnStart" onclick="startCapture()" style="background:#16a34a; color:white; border:none; padding:9px 16px; border-radius:6px; font-weight:bold; cursor:pointer;">▶️ Bắt đầu Lắng nghe & Ghi âm</button>
-        <button id="btnStop" onclick="stopCapture()" disabled style="background:#dc2626; color:white; border:none; padding:9px 16px; border-radius:6px; font-weight:bold; cursor:pointer; opacity:0.5;">⏹️ Dừng</button>
-      </div>
+        web_audio_component = f"""
+        <div style="background:#ffffff; border:1px solid #cbd5e1; border-radius:12px; padding:14px; font-family:system-ui,-apple-system,sans-serif; box-shadow:0 2px 8px rgba(0,0,0,0.04);">
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+            <select id="audioSource" style="flex:1; min-width:190px; padding:7px 10px; border-radius:6px; border:1px solid #94a3b8; font-weight:600; font-size:13px;"></select>
+            <button id="btnStart" onclick="startCapture()" style="background:#16a34a; color:white; border:none; padding:8px 14px; border-radius:6px; font-weight:700; cursor:pointer; font-size:13px;">▶️ Thu & Lọc Nhiễu</button>
+            <button id="btnStop" onclick="stopCapture()" disabled style="background:#dc2626; color:white; border:none; padding:8px 14px; border-radius:6px; font-weight:700; cursor:pointer; opacity:0.4; font-size:13px;">⏹️ Dừng</button>
+            <button onclick="openFloatingPip()" title="Tách phụ đề thành cửa sổ nổi luôn nằm trên MS Teams/Zoom" style="background:#003366; color:white; border:none; padding:8px 12px; border-radius:6px; font-weight:600; cursor:pointer; font-size:13px;">🪟 Phụ đề Nổi (Teams/Zoom)</button>
+            <span id="timerDisplay" style="background:#0f172a; color:#38bdf8; padding:6px 10px; border-radius:6px; font-family:monospace; font-weight:bold; font-size:14px;">00:00:00</span>
+          </div>
 
-      <div style="display:flex; gap:10px; margin-bottom:10px;">
-        <a id="downloadAudio" style="display:none; background:#2563eb; color:white; text-decoration:none; padding:8px 14px; border-radius:6px; font-weight:bold; font-size:13px;">💾 1. Tải File Ghi Âm (.webm)</a>
-        <a id="downloadTxt" style="display:none; background:#0d9488; color:white; text-decoration:none; padding:8px 14px; border-radius:6px; font-weight:bold; font-size:13px;">📄 2. Tải File Phụ Đề Có Tên Nhân Sự (.txt)</a>
-      </div>
+          <div style="margin-bottom:10px;">
+            <div style="font-size:12px; color:#475569; font-weight:600; margin-bottom:5px;">🗣️ Bấm chọn nhanh Người đang phát biểu (1-Click Tag):</div>
+            <div id="speakerPills" style="display:flex; gap:6px; flex-wrap:wrap;"></div>
+          </div>
 
-      <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px; font-size:13px; color:#334155;">
-        <span>🎚️ <b>Tín hiệu VB-Cable (Đã lọc nhiễu DSP):</b></span>
-        <div style="flex:1; height:10px; background:#e2e8f0; border-radius:5px; overflow:hidden;">
-          <div id="volumeBar" style="width:0%; height:100%; background:#22c55e; transition:width 0.08s;"></div>
+          <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:12px; color:#334155;">
+            <span>🎚️ <b>DSP VB-Cable:</b></span>
+            <div style="flex:1; height:8px; background:#e2e8f0; border-radius:4px; overflow:hidden;">
+              <div id="volumeBar" style="width:0%; height:100%; background:linear-gradient(90deg,#22c55e,#eab308); transition:width 0.08s;"></div>
+            </div>
+            <span id="statusText" style="font-weight:bold; color:#64748b;">Chờ kích hoạt</span>
+            <a id="downloadAudio" style="display:none; background:#2563eb; color:white; text-decoration:none; padding:4px 10px; border-radius:5px; font-weight:bold;">💾 Audio (.webm)</a>
+            <a id="downloadTxt" style="display:none; background:#0d9488; color:white; text-decoration:none; padding:4px 10px; border-radius:5px; font-weight:bold;">📄 Phụ đề (.txt)</a>
+          </div>
+
+          <div id="liveSubBox" style="height:310px; overflow-y:auto; background:#0f172a; color:#f8fafc; padding:14px; border-radius:8px; font-size:14.5px; line-height:1.65; border:1px solid #1e293b;">
+            <div id="finalSubtitles"></div>
+            <div id="interimSubtitle" style="color:#38bdf8; font-style:italic;"></div>
+          </div>
+
+          <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:12px; color:#64748b;">💡 Bấm <b>Copy sang Bàn Dịch</b> để đẩy toàn bộ sang cột bên phải:</span>
+            <button onclick="copyTranscript()" style="background:#0284c7; color:white; border:none; padding:6px 14px; border-radius:6px; font-weight:bold; cursor:pointer; font-size:12.5px;">📋 Copy toàn bộ sang Bàn Dịch ➔</button>
+          </div>
+          <textarea id="fullBuffer" style="display:none;"></textarea>
         </div>
-        <span id="statusText" style="font-weight:bold; color:#64748b;">Chờ kích hoạt...</span>
-      </div>
 
-      <div id="liveSubBox" style="height:225px; overflow-y:auto; background:#0f172a; color:#f8fafc; padding:14px; border-radius:8px; font-size:15px; line-height:1.6;">
-        <div id="finalSubtitles"></div>
-        <div id="interimSubtitle" style="color:#38bdf8; font-style:italic;"></div>
-      </div>
+        <script>
+          let mediaStream = null, mediaRecorder = null, recordedChunks = [], recognition = null;
+          let isCapturing = false, audioContext = null, analyser = null;
+          let currentSpeaker = "", timerInterval = null, secondsElapsed = 0, pipWindow = null;
+          const glossary = {glossary_json_str};
+          const tm = {tm_json_str};
+          const personnelList = {personnel_json_str};
 
-      <div style="margin-top:10px; display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:12px; color:#475569;">✨ Phụ đề tự động đính kèm Tên nhân sự, Chức danh & Phòng ban để AI Recap bóc tách chính xác:</span>
-        <button onclick="copyTranscript()" style="background:#0284c7; color:white; border:none; padding:7px 14px; border-radius:6px; font-weight:bold; cursor:pointer;">📋 Copy toàn bộ nội dung họp</button>
-      </div>
-      <textarea id="fullBuffer" style="width:100%; height:85px; margin-top:6px; border-radius:6px; border:1px solid #cbd5e1; padding:8px; font-size:13px;" placeholder="Nội dung phụ đề kèm mốc thời gian & người phát biểu sẽ tự động ghi vào đây..."></textarea>
-    </div>
+          function renderSpeakerPills() {{
+            const container = document.getElementById('speakerPills');
+            container.innerHTML = '';
+            const allOptions = [{{ label: 'Tự động / Chung', val: '' }}].concat(
+              personnelList.map(p => ({{
+                label: p.ho_ten.replace(/^(Ông|Bà|Anh|Chị)\\s+/i, '') + ' (' + p.phong_ban + ')',
+                val: `${{p.ho_ten}} – ${{p.chuc_danh}} (${{p.phong_ban}})`
+              }}))
+            );
+            allOptions.forEach(item => {{
+              const btn = document.createElement('button');
+              btn.innerText = item.val === '' ? '🔄 Tự động' : '👤 ' + item.label;
+              const active = currentSpeaker === item.val;
+              btn.style.cssText = `padding:5px 10px; border-radius:16px; font-size:12px; font-weight:600; cursor:pointer; border:1px solid ${{active ? '#0284c7' : '#cbd5e1'}}; background:${{active ? '#0284c7' : '#f8fafc'}}; color:${{active ? '#fff' : '#334155'}}; transition:0.15s;`;
+              btn.onclick = () => {{ currentSpeaker = item.val; renderSpeakerPills(); }};
+              container.appendChild(btn);
+            }});
+          }}
+          renderSpeakerPills();
 
-    <script>
-      let mediaStream = null;
-      let mediaRecorder = null;
-      let recordedChunks = [];
-      let recognition = null;
-      let isCapturing = false;
-      let audioContext = null;
-      let analyser = null;
-      const glossary = {glossary_json_str};
-      const tm = {tm_json_str};
-      const personnelList = {personnel_json_str};
+          function formatTime(sec) {{
+            const h = String(Math.floor(sec / 3600)).padStart(2, '0');
+            const m = String(Math.floor((sec % 3600) / 60)).padStart(2, '0');
+            const s = String(sec % 60).padStart(2, '0');
+            return `${{h}}:${{m}}:${{s}}`;
+          }}
 
-      function loadPersonnelDropdown() {{
-        const spkSelect = document.getElementById('speakerSelect');
-        personnelList.forEach(p => {{
-          const opt = document.createElement('option');
-          const label = `${{p.ho_ten}} – ${{p.chuc_danh}} (${{p.phong_ban}})`;
-          opt.value = label;
-          opt.text = '🗣️ ' + label;
-          spkSelect.appendChild(opt);
-        }});
-      }}
-      loadPersonnelDropdown();
-
-      async function loadAudioDevices() {{
-        try {{
-          await navigator.mediaDevices.getUserMedia({{ audio: true }});
-          const devices = await navigator.mediaDevices.enumerateDevices();
-          const select = document.getElementById('audioSource');
-          select.innerHTML = '';
-          devices.filter(d => d.kind === 'audioinput').forEach(d => {{
-            const opt = document.createElement('option');
-            opt.value = d.deviceId;
-            opt.text = d.label || 'Microphone / Audio Input';
-            if (opt.text.toLowerCase().includes('cable')) {{
-              opt.selected = true;
-              opt.text = '⭐ ' + opt.text + ' (Chuẩn VB-Audio Virtual Cable)';
+          async function openFloatingPip() {{
+            if ('documentPictureInPicture' in window) {{
+              pipWindow = await window.documentPictureInPicture.requestWindow({{ width: 650, height: 240 }});
+              pipWindow.document.body.style.cssText = "background:#0f172a; color:#f8fafc; font-family:sans-serif; padding:12px; margin:0; overflow-y:auto;";
+              pipWindow.document.body.innerHTML = `<div style="font-size:12px; color:#38bdf8; font-weight:bold; margin-bottom:6px;">🚗 THACO LIVE SUBTITLES (LUÔN NỔI TRÊN TEAMS/ZOOM)</div><div id="pipContent" style="font-size:16px; line-height:1.5;"></div>`;
+            }} else {{
+              alert("Trình duyệt cần là Chrome/Edge bản mới để bật Cửa sổ nổi Picture-in-Picture.");
             }}
-            select.appendChild(opt);
-          }});
-        }} catch (e) {{
-          document.getElementById('statusText').innerText = 'Vui lòng cấp quyền Micro trên trình duyệt!';
-        }}
-      }}
-      loadAudioDevices();
-
-      function enrichWithSharedMemoryAndPersonnel(text) {{
-        let html = text;
-        // 1. Tự động phát hiện tên nhân sự được nhắc tới trong câu nói
-        personnelList.forEach(p => {{
-          const cleanName = p.ho_ten.replace(/^(Ông|Bà|Anh|Chị)\\s+/i, '').trim();
-          if (cleanName.length > 3 && text.toLowerCase().includes(cleanName.toLowerCase())) {{
-            html += ` <span style="background:#059669; color:#fff; padding:1px 6px; border-radius:4px; font-size:12px;">[👤 ${{p.ho_ten}} - ${{p.chuc_danh}} (${{p.phong_ban}})]</span>`;
           }}
-        }});
 
-        // 2. So khớp TM dùng chung
-        if (tm[text]) {{
-          html += `<br><span style="color:#4ade80; font-weight:bold;">⚡ [TM Chuẩn]: ${{tm[text]}}</span>`;
-        }}
-
-        // 3. So khớp Glossary dùng chung
-        for (const [vn, en] of Object.entries(glossary)) {{
-          if (vn && text.toLowerCase().includes(vn.toLowerCase())) {{
-            html += ` <span style="background:#ca8a04; color:#fff; padding:1px 6px; border-radius:4px; font-size:12px;">[${{vn}} ➔ ${{en}}]</span>`;
-          }} else if (en && text.toLowerCase().includes(en.toLowerCase())) {{
-            html += ` <span style="background:#ca8a04; color:#fff; padding:1px 6px; border-radius:4px; font-size:12px;">[${{en}} ➔ ${{vn}}]</span>`;
+          async function loadAudioDevices() {{
+            try {{
+              await navigator.mediaDevices.getUserMedia({{ audio: true }});
+              const devices = await navigator.mediaDevices.enumerateDevices();
+              const select = document.getElementById('audioSource');
+              select.innerHTML = '';
+              devices.filter(d => d.kind === 'audioinput').forEach(d => {{
+                const opt = document.createElement('option');
+                opt.value = d.deviceId;
+                opt.text = d.label || 'Audio Input';
+                if (opt.text.toLowerCase().includes('cable')) {{
+                  opt.selected = true;
+                  opt.text = '⭐ ' + opt.text;
+                }}
+                select.appendChild(opt);
+              }});
+            }} catch (e) {{}}
           }}
-        }}
-        return html;
-      }}
+          loadAudioDevices();
 
-      function updateTxtDownloadLink() {{
-        const textVal = document.getElementById('fullBuffer').value;
-        if (!textVal.trim()) return;
-        const blobTxt = new Blob([textVal], {{ type: 'text/plain;charset=utf-8' }});
-        const urlTxt = URL.createObjectURL(blobTxt);
-        const aTxt = document.getElementById('downloadTxt');
-        aTxt.href = urlTxt;
-        aTxt.download = 'Phu_De_Hop_THACO_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.txt';
-        aTxt.style.display = 'inline-block';
-      }}
-
-      async function startCapture() {{
-        const deviceId = document.getElementById('audioSource').value;
-        try {{
-          mediaStream = await navigator.mediaDevices.getUserMedia({{
-            audio: {{
-              deviceId: deviceId ? {{ exact: deviceId }} : undefined,
-              noiseSuppression: true,
-              echoCancellation: true,
-              autoGainControl: true
+          function enrichText(text) {{
+            let html = text;
+            personnelList.forEach(p => {{
+              const cleanName = p.ho_ten.replace(/^(Ông|Bà|Anh|Chị)\\s+/i, '').trim();
+              if (cleanName.length > 3 && text.toLowerCase().includes(cleanName.toLowerCase())) {{
+                html += ` <span style="background:#059669; color:#fff; padding:1px 6px; border-radius:4px; font-size:11.5px;">[👤 ${{p.ho_ten}} - ${{p.phong_ban}}]</span>`;
+              }}
+            }});
+            if (tm[text]) {{
+              html += `<br><span style="color:#4ade80; font-weight:bold;">⚡ [TM]: ${{tm[text]}}</span>`;
             }}
-          }});
-
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-          const source = audioContext.createMediaStreamSource(mediaStream);
-          analyser = audioContext.createAnalyser();
-          analyser.fftSize = 256;
-          source.connect(analyser);
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          function updateVolume() {{
-            if (!isCapturing) return;
-            analyser.getByteFrequencyData(dataArray);
-            let sum = dataArray.reduce((a, b) => a + b, 0);
-            let avg = Math.min(100, Math.round((sum / dataArray.length) * 1.8));
-            document.getElementById('volumeBar').style.width = avg + '%';
-            requestAnimationFrame(updateVolume);
-          }}
-
-          recordedChunks = [];
-          mediaRecorder = new MediaRecorder(mediaStream);
-          mediaRecorder.ondataavailable = e => {{ if (e.data.size > 0) recordedChunks.push(e.data); }};
-          mediaRecorder.onstop = () => {{
-            const blob = new Blob(recordedChunks, {{ type: 'audio/webm' }});
-            const url = URL.createObjectURL(blob);
-            const a = document.getElementById('downloadAudio');
-            a.href = url;
-            a.download = 'Ghi_Am_Hop_THACO_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
-            a.style.display = 'inline-block';
-            updateTxtDownloadLink();
-          }};
-          mediaRecorder.start();
-
-          const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
-          recognition = new SpeechRec();
-          recognition.lang = '{speech_lang}';
-          recognition.continuous = true;
-          recognition.interimResults = true;
-
-          recognition.onresult = (event) => {{
-            let interim = '';
-            const currentSpeaker = document.getElementById('speakerSelect').value;
-            const speakerBadge = currentSpeaker ? `<span style="color:#38bdf8; font-weight:bold;">[${{currentSpeaker}}]</span> ` : '';
-            const speakerTxtPrefix = currentSpeaker ? `[${{currentSpeaker}}] ` : '';
-
-            for (let i = event.resultIndex; i < event.results.length; ++i) {{
-              const transcript = event.results[i][0].transcript.trim();
-              if (event.results[i].isFinal) {{
-                const now = new Date().toLocaleTimeString('vi-VN');
-                const decorated = enrichWithSharedMemoryAndPersonnel(transcript);
-                const finalDiv = document.getElementById('finalSubtitles');
-                finalDiv.innerHTML += `<div style="margin-bottom:8px; border-bottom:1px dashed #334155; padding-bottom:4px;"><span style="color:#94a3b8;">[${{now}}]</span> ${{speakerBadge}}${{decorated}}</div>`;
-                const box = document.getElementById('liveSubBox');
-                box.scrollTop = box.scrollHeight;
-
-                const buf = document.getElementById('fullBuffer');
-                buf.value += `[${{now}}] ${{speakerTxtPrefix}}${{transcript}}\\n`;
-                buf.scrollTop = buf.scrollHeight;
-                updateTxtDownloadLink();
-              }} else {{
-                interim += transcript;
+            for (const [vn, en] of Object.entries(glossary)) {{
+              if (vn && text.toLowerCase().includes(vn.toLowerCase())) {{
+                html += ` <span style="background:#ca8a04; color:#fff; padding:1px 6px; border-radius:4px; font-size:11.5px;">[${{vn}} ➔ ${{en}}]</span>`;
+              }} else if (en && text.toLowerCase().includes(en.toLowerCase())) {{
+                html += ` <span style="background:#ca8a04; color:#fff; padding:1px 6px; border-radius:4px; font-size:11.5px;">[${{en}} ➔ ${{vn}}]</span>`;
               }}
             }}
-            document.getElementById('interimSubtitle').innerText = interim ? '⏳ ' + interim : '';
-          }};
+            return html;
+          }}
 
-          recognition.onend = () => {{ if (isCapturing) recognition.start(); }};
-          isCapturing = true;
-          recognition.start();
-          updateVolume();
+          function updateTxtDownloadLink() {{
+            const textVal = document.getElementById('fullBuffer').value;
+            if (!textVal.trim()) return;
+            const blobTxt = new Blob([textVal], {{ type: 'text/plain;charset=utf-8' }});
+            const aTxt = document.getElementById('downloadTxt');
+            aTxt.href = URL.createObjectURL(blobTxt);
+            aTxt.download = 'Phu_De_Hop_THACO_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.txt';
+            aTxt.style.display = 'inline-block';
+          }}
 
-          document.getElementById('btnStart').disabled = true;
-          document.getElementById('btnStart').style.opacity = '0.5';
-          document.getElementById('btnStop').disabled = false;
-          document.getElementById('btnStop').style.opacity = '1';
-          document.getElementById('statusText').innerText = '🟢 Đang thu & lọc nhiễu...';
-          document.getElementById('statusText').style.color = '#16a34a';
-        }} catch (err) {{
-          alert('Không thể mở thiết bị âm thanh: ' + err.message);
-        }}
-      }}
+          async function startCapture() {{
+            const deviceId = document.getElementById('audioSource').value;
+            try {{
+              mediaStream = await navigator.mediaDevices.getUserMedia({{
+                audio: {{ deviceId: deviceId ? {{ exact: deviceId }} : undefined, noiseSuppression: true, echoCancellation: true, autoGainControl: true }}
+              }});
+              audioContext = new (window.AudioContext || window.webkitAudioContext)();
+              const source = audioContext.createMediaStreamSource(mediaStream);
+              analyser = audioContext.createAnalyser();
+              analyser.fftSize = 256;
+              source.connect(analyser);
+              const dataArray = new Uint8Array(analyser.frequencyBinCount);
+              function updateVolume() {{
+                if (!isCapturing) return;
+                analyser.getByteFrequencyData(dataArray);
+                let avg = Math.min(100, Math.round((dataArray.reduce((a, b) => a + b, 0) / dataArray.length) * 1.8));
+                document.getElementById('volumeBar').style.width = avg + '%';
+                requestAnimationFrame(updateVolume);
+              }}
 
-      function stopCapture() {{
-        isCapturing = false;
-        if (recognition) recognition.stop();
-        if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-        if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
-        if (audioContext) audioContext.close();
-        updateTxtDownloadLink();
-        document.getElementById('btnStart').disabled = false;
-        document.getElementById('btnStart').style.opacity = '1';
-        document.getElementById('btnStop').disabled = true;
-        document.getElementById('btnStop').style.opacity = '0.5';
-        document.getElementById('statusText').innerText = '⏹️ Đã dừng. Hãy bấm tải File Ghi Âm hoặc File .TXT!';
-        document.getElementById('statusText').style.color = '#dc2626';
-      }}
+              recordedChunks = [];
+              mediaRecorder = new MediaRecorder(mediaStream);
+              mediaRecorder.ondataavailable = e => {{ if (e.data.size > 0) recordedChunks.push(e.data); }};
+              mediaRecorder.onstop = () => {{
+                const blob = new Blob(recordedChunks, {{ type: 'audio/webm' }});
+                const a = document.getElementById('downloadAudio');
+                a.href = URL.createObjectURL(blob);
+                a.download = 'Ghi_Am_Hop_THACO_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
+                a.style.display = 'inline-block';
+                updateTxtDownloadLink();
+              }};
+              mediaRecorder.start();
 
-      function copyTranscript() {{
-        const buf = document.getElementById('fullBuffer');
-        buf.select();
-        document.execCommand('copy');
-        alert('Đã copy toàn bộ nội dung!');
-      }}
-    </script>
-    """
-    components.html(web_audio_component, height=500)
+              const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+              recognition = new SpeechRec();
+              recognition.lang = '{speech_lang}';
+              recognition.continuous = true;
+              recognition.interimResults = true;
 
-    st.markdown("#### 🔄 Bàn Dịch Thuật & Hiệu Đính Đồng Bộ (`upsert_tm`)")
-    col_in, col_out = st.columns([1, 1.2])
-    with col_in:
+              recognition.onresult = (event) => {{
+                let interim = '';
+                const spkBadge = currentSpeaker ? `<span style="color:#38bdf8; font-weight:bold;">[${{currentSpeaker}}]</span> ` : '';
+                const spkTxt = currentSpeaker ? `[${{currentSpeaker}}] ` : '';
+
+                for (let i = event.resultIndex; i < event.results.length; ++i) {{
+                  const transcript = event.results[i][0].transcript.trim();
+                  if (event.results[i].isFinal) {{
+                    const now = new Date().toLocaleTimeString('vi-VN');
+                    const decorated = enrichText(transcript);
+                    const rowHtml = `<div style="margin-bottom:7px; border-bottom:1px dashed #334155; padding-bottom:4px;"><span style="color:#94a3b8;">[${{now}}]</span> ${{spkBadge}}${{decorated}}</div>`;
+                    const finalDiv = document.getElementById('finalSubtitles');
+                    finalDiv.innerHTML += rowHtml;
+                    const box = document.getElementById('liveSubBox');
+                    box.scrollTop = box.scrollHeight;
+
+                    if (pipWindow && !pipWindow.closed) {{
+                      const pipDiv = pipWindow.document.getElementById('pipContent');
+                      if (pipDiv) {{ pipDiv.innerHTML = rowHtml; }}
+                    }}
+
+                    const buf = document.getElementById('fullBuffer');
+                    buf.value += `[${{now}}] ${{spkTxt}}${{transcript}}\\n`;
+                    updateTxtDownloadLink();
+                  }} else {{
+                    interim += transcript;
+                  }}
+                }}
+                document.getElementById('interimSubtitle').innerText = interim ? '⏳ ' + interim : '';
+              }};
+
+              recognition.onend = () => {{ if (isCapturing) recognition.start(); }};
+              isCapturing = true;
+              recognition.start();
+              updateVolume();
+
+              secondsElapsed = 0;
+              clearInterval(timerInterval);
+              timerInterval = setInterval(() => {{
+                secondsElapsed++;
+                document.getElementById('timerDisplay').innerText = formatTime(secondsElapsed);
+              }}, 1000);
+
+              document.getElementById('btnStart').disabled = true;
+              document.getElementById('btnStart').style.opacity = '0.4';
+              document.getElementById('btnStop').disabled = false;
+              document.getElementById('btnStop').style.opacity = '1';
+              document.getElementById('statusText').innerText = '🟢 Đang thu';
+              document.getElementById('statusText').style.color = '#16a34a';
+            }} catch (err) {{
+              alert('Không thể mở thiết bị âm thanh: ' + err.message);
+            }}
+          }}
+
+          function stopCapture() {{
+            isCapturing = false;
+            clearInterval(timerInterval);
+            if (recognition) recognition.stop();
+            if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (audioContext) audioContext.close();
+            updateTxtDownloadLink();
+            document.getElementById('btnStart').disabled = false;
+            document.getElementById('btnStart').style.opacity = '1';
+            document.getElementById('btnStop').disabled = true;
+            document.getElementById('btnStop').style.opacity = '0.4';
+            document.getElementById('statusText').innerText = '⏹️ Đã dừng';
+            document.getElementById('statusText').style.color = '#dc2626';
+          }}
+
+          function copyTranscript() {{
+            const textVal = document.getElementById('fullBuffer').value;
+            navigator.clipboard.writeText(textVal);
+            alert('Đã copy! Hãy bấm Ctrl+V vào ô bên phải để dịch & chuẩn hóa.');
+          }}
+        </script>
+        """
+        components.html(web_audio_component, height=525)
+
+    with col_right_cockpit:
+        st.markdown("##### 🔄 Bàn Dịch Thuật & Hiệu Đính Đồng Bộ (`upsert_tm`)")
         raw_input_box = st.text_area(
-            "📥 Dán nội dung cuộc họp vừa Copy (hoặc nhập câu cần dịch):",
+            "📥 Dán nội dung vừa Copy (Ctrl+V) hoặc gõ câu cần dịch:",
             value=st.session_state.raw_stream_input,
-            height=210,
-            placeholder="[09:15:20] [Ông Võ Thành Lưu – TP QLCL xe Thương mại] Đề nghị BJM gửi báo cáo kỹ thuật trước ngày 20/11..."
+            height=135,
+            placeholder="[09:15:20] [Ông Võ Thành Lưu – TP QLCL xe Thương mại] Đề nghị BJM gửi báo cáo kỹ thuật..."
         )
         if st.button(f"🚀 Dịch Chuẩn Hóa ({selected_trans_model}) & Đẩy Lên TM", type="primary", use_container_width=True):
             st.session_state.raw_stream_input = raw_input_box
@@ -905,30 +988,27 @@ with tab1:
                     c_part = line[idx+1:].strip()
                 parsed_lines.append((t_tag, c_part))
 
-            with st.spinner(f"Đang đối chiếu TM/Glossary/Nhân sự và dịch bằng {selected_trans_model}..."):
+            with st.spinner(f"Đang dịch bằng {selected_trans_model}..."):
                 st.session_state.transcript_list = translate_batch_with_thaco_memory(
                     parsed_lines, trans_mode, gemini_api_key, selected_trans_model, webapp_url
                 )
-                st.success("Đã dịch và đồng bộ tự động các câu mới lên Sheet TM!")
 
-    with col_out:
-        st.markdown("**✏️ Hiệu đính nhanh bản dịch (Sửa trực tiếp cột 'Bản Dịch Chuẩn' để ghi đè lên Sheet TM):**")
         if st.session_state.transcript_list:
             edited_subtitles = st.data_editor(
                 st.session_state.transcript_list,
                 column_config={
-                    "time": st.column_config.TextColumn("Thời gian", width="small", disabled=True),
-                    "source": st.column_config.TextColumn("Câu gốc (Khoa_Goc)", width="medium"),
-                    "target": st.column_config.TextColumn("Bản Dịch Chuẩn (Ban_Dich_Chuan)", width="large"),
+                    "time": st.column_config.TextColumn("Giờ", width="small", disabled=True),
+                    "source": st.column_config.TextColumn("Câu gốc", width="medium"),
+                    "target": st.column_config.TextColumn("Bản Dịch Chuẩn (Sửa trực tiếp)", width="large"),
                     "terms": st.column_config.ListColumn("Thuật ngữ", width="small")
                 },
                 use_container_width=True,
-                height=200,
+                height=245,
                 key="sub_editor"
             )
             st.session_state.transcript_list = edited_subtitles
 
-            if st.button("💾 Lưu các câu vừa hiệu đính đè lên Google Sheets (`upsert_tm`)", use_container_width=True):
+            if st.button("💾 Lưu bản dịch vừa hiệu đính đè lên Google Sheets (`upsert_tm`)", use_container_width=True):
                 upsert_dict = {item["source"]: item["target"] for item in edited_subtitles if item.get("source") and item.get("target")}
                 ok, msg = upsert_tm_to_sheets(webapp_url, upsert_dict)
                 if ok:
@@ -936,62 +1016,111 @@ with tab1:
                 else:
                     st.error(msg)
         else:
-            st.info("Chưa có dữ liệu dịch. Hãy bấm nút Dịch bên trái để hiển thị bảng hiệu đính.")
+            st.info("💡 Khung Hiệu đính trực tiếp sẽ hiển thị ngay tại đây sau khi anh bấm nút Dịch ở trên.")
 
-# ----------------- TAB 2: AI RECAP KẾT HỢP DANH BẠ NHÂN SỰ THACO -----------------
+# ----------------- TAB 2: THIẾT LẬP NHÂN SỰ, MẪU BBH ĐẦU VÀO & AI RECAP -----------------
 with tab2:
-    st.subheader(f"🧠 Tổng Hợp Nội Dung Họp Kèm Đối Chiếu Danh Bạ Nhân Sự (`{selected_recap_model}`)")
+    st.markdown("""
+    <div class="step-card">
+        <b>🎯 Quy trình AI Recap Chuẩn Xác Theo Form & Nhân Sự:</b><br>
+        1️⃣ <b>Chọn người tham gia & Tải lên Mẫu BBH (.docx):</b> Giúp AI biết chính xác những ai có mặt trong cuộc họp và cấu trúc các cột/bảng của Mẫu BBH.<br>
+        2️⃣ <b>Chọn nguồn dữ liệu họp (File Ghi Âm / .TXT):</b> AI sẽ đối chiếu giọng nói/nội dung với đúng tên Nhân sự, Phòng ban và Bảng thuật ngữ THACO để điền vào Form.
+    </div>
+    """, unsafe_allow_html=True)
 
-    input_source_mode = st.radio(
-        "📂 Chọn nguồn đầu vào cho AI Recap:",
-        [
-            "🎙️ 1. Dùng File Ghi Âm (.webm / .wav / .mp3 / .m4a) - Hỗ trợ cả file nặng >75MB dài hàng giờ",
-            "📄 2. Dùng File Phụ Đề (.txt) tải về từ Bước 1",
-            "📝 3. Dùng trực tiếp văn bản đã dịch / dán ở Bước 1"
+    # KHỐI 1: CHỌN NHÂN SỰ THAM GIA & TẢI MẪU BBH ĐẦU VÀO TRƯỚC KHI RECAP
+    col_setup_p, col_setup_tpl = st.columns([1.2, 1], gap="medium")
+
+    with col_setup_p:
+        st.markdown("##### 👥 1. Chọn Nhân sự tham gia cuộc họp (Đầu vào cho AI & Bảng Thành phần)")
+        all_p_labels = [
+            f"{p.get('ho_ten', '')} – {p.get('chuc_danh', '')} ({p.get('phong_ban', '')})"
+            for p in st.session_state.personnel
         ]
-    )
-
-    uploaded_audio_recap = None
-    uploaded_txt_recap = None
-    text_for_recap = ""
-
-    if input_source_mode.startswith("🎙️"):
-        uploaded_audio_recap = st.file_uploader(
-            "Tải lên File Ghi Âm cuộc họp (.webm, .wav, .mp3, .m4a):",
-            type=["webm", "wav", "mp3", "m4a", "ogg"]
+        selected_p_labels_step2 = st.multiselect(
+            "Tick chọn những nhân sự tham dự cuộc họp hôm nay:",
+            options=all_p_labels,
+            default=all_p_labels,
+            key="multiselect_attendees_step2"
         )
-        if uploaded_audio_recap:
-            st.audio(uploaded_audio_recap)
-    elif input_source_mode.startswith("📄"):
-        uploaded_txt_recap = st.file_uploader(
-            "Tải lên File Phụ Đề (.txt) vừa tải xuống từ Bước 1:",
-            type=["txt"]
-        )
-        if uploaded_txt_recap:
-            text_for_recap = uploaded_txt_recap.read().decode("utf-8", errors="ignore")
-            st.text_area("Nội dung trong file .txt:", value=text_for_recap, height=120)
-    else:
-        combined_transcript = "\n".join(
-            [f"[{x['time']}] {x['target']} (Gốc: {x['source']})" for x in st.session_state.transcript_list]
-        ) or st.session_state.raw_stream_input
-        text_for_recap = st.text_area(
-            "Nội dung văn bản cuộc họp:",
-            value=combined_transcript,
-            height=130
+        st.session_state.selected_attendees = [
+            p for p, lbl in zip(st.session_state.personnel, all_p_labels) if lbl in selected_p_labels_step2
+        ]
+        st.session_state.extra_attendees_str = st.text_input(
+            "➕ Nhân sự / Đối tác bổ sung ngoài danh bạ (nếu có, phân cách bằng dấu phẩy):",
+            value=st.session_state.extra_attendees_str,
+            placeholder="VD: Mr. Wang - Kỹ sư BJM, Ông Lê Văn A - NM Bus..."
         )
 
-    prompt_templates = {
-        "1. Mẫu chuẩn Biên Bản Họp Phòng QLCL KCN - THACO AUTO (7 cột chuẩn + Tự động gán Nhân sự/Đơn vị)": """Đóng vai Trưởng Phòng Quản lý Chất lượng (Phòng QLCL KCN - THACO AUTO). Dựa vào toàn bộ nội dung cuộc họp, Bảng thuật ngữ THACO và Danh sách Nhân sự - Chức danh - Phòng ban đính kèm, hãy tổng hợp nội dung thảo luận và kế hoạch triển khai thành định dạng JSON chuẩn để đổ trực tiếp vào mẫu Biên Bản Họp:
+    with col_setup_tpl:
+        st.markdown("##### 📄 2. Tải lên Mẫu BBH (.docx) làm chuẩn đầu vào cho AI")
+        uploaded_tpl_step2 = st.file_uploader(
+            "Tải file Word BBH Mẫu (VD: `2026-1113. BB họp chất lượng xe xuất khẩuV4 - Copy.docx`):",
+            type=["docx"],
+            key="uploader_tpl_step2"
+        )
+        if uploaded_tpl_step2 is not None:
+            st.session_state.template_docx_bytes = uploaded_tpl_step2.getvalue()
+            st.session_state.template_docx_name = uploaded_tpl_step2.name
+            st.session_state.template_structure_hint = inspect_docx_template(st.session_state.template_docx_bytes)
+            st.success(f"✅ Đã nạp mẫu `{uploaded_tpl_step2.name}`! AI sẽ bám sát cấu trúc mẫu này và dùng luôn cho Bước 3.")
+        elif st.session_state.template_docx_bytes is not None:
+            st.info(f"📌 Đang sử dụng mẫu đã nạp: `{st.session_state.template_docx_name}`")
+        else:
+            st.caption("Nếu chưa tải file mẫu, hệ thống sẽ dùng cấu trúc chuẩn 7 cột của Phòng QLCL KCN - THACO AUTO.")
+
+    st.divider()
+
+    # KHỐI 2: CHỌN NGUỒN DỮ LIỆU CUỘC HỌP & PROMPT RECAP
+    col_src, col_prm = st.columns([1, 1.2], gap="medium")
+
+    with col_src:
+        st.markdown("##### 🎙️ 3. Chọn nguồn dữ liệu cuộc họp")
+        input_source_mode = st.radio(
+            "Nguồn đầu vào:",
+            [
+                "🎙️ File Ghi Âm (.webm / .wav / .mp3 / .m4a) - Hỗ trợ file lớn >75MB",
+                "📄 File Phụ Đề (.txt) tải về từ Bước 1",
+                "📝 Văn bản đã dịch / dán trực tiếp từ Bước 1"
+            ]
+        )
+
+        uploaded_audio_recap = None
+        uploaded_txt_recap = None
+        text_for_recap = ""
+
+        if input_source_mode.startswith("🎙️"):
+            uploaded_audio_recap = st.file_uploader(
+                "Tải lên File Ghi Âm cuộc họp (.webm, .wav, .mp3, .m4a):",
+                type=["webm", "wav", "mp3", "m4a", "ogg"]
+            )
+            if uploaded_audio_recap:
+                st.audio(uploaded_audio_recap)
+        elif input_source_mode.startswith("📄"):
+            uploaded_txt_recap = st.file_uploader("Tải lên File Phụ Đề (.txt):", type=["txt"])
+            if uploaded_txt_recap:
+                text_for_recap = uploaded_txt_recap.read().decode("utf-8", errors="ignore")
+                st.text_area("Nội dung file .txt:", value=text_for_recap, height=110)
+        else:
+            combined_transcript = "\n".join(
+                [f"[{x['time']}] {x['target']} (Gốc: {x['source']})" for x in st.session_state.transcript_list]
+            ) or st.session_state.raw_stream_input
+            text_for_recap = st.text_area("Nội dung văn bản cuộc họp:", value=combined_transcript, height=120)
+
+    with col_prm:
+        st.markdown("##### 📌 4. Kịch bản Prompt Recap (Tự động kết hợp Nhân sự & Mẫu BBH)")
+        prompt_templates = {
+            "1. Mẫu chuẩn Biên Bản Họp Phòng QLCL KCN - THACO AUTO (7 cột chuẩn)": """Đóng vai Trưởng Phòng Quản lý Chất lượng (Phòng QLCL KCN - THACO AUTO). Dựa vào toàn bộ nội dung cuộc họp, Danh sách Nhân sự THACO thực tế tham dự, Cấu trúc File Mẫu BBH và Bảng thuật ngữ THACO đính kèm, hãy phân tích và xuất ra JSON chuẩn để đổ trực tiếp vào mẫu Biên Bản Họp:
 {
-  "ve_viec": "Tóm tắt chủ đề cuộc họp ngắn gọn (1 dòng để điền vào mục V/v: ...)",
+  "ve_viec": "Tóm tắt chủ đề cuộc họp ngắn gọn, chuẩn văn phong hành chính THACO (1 dòng để điền vào mục V/v: ...)",
   "rows": [
     {
       "tt": "1",
       "van_de": "Tên vấn đề / Hạng mục lỗi / Báo cáo khiếu nại cụ thể",
-      "noi_dung_thao_luan": "Chi tiết nội dung các bên đã thảo luận, ý kiến của từng nhân sự/bộ phận, nguyên nhân, hiện trạng kỹ thuật",
+      "noi_dung_thao_luan": "Chi tiết nội dung các bên đã thảo luận, ý kiến của từng nhân sự/đơn vị tham gia, nguyên nhân gốc rễ, hiện trạng kỹ thuật",
       "cong_viec_tiep_theo": "Đối sách, công việc thực hiện tiếp theo cụ thể, rõ ràng",
-      "trach_nhiem": "Đơn vị / Cá nhân chịu trách nhiệm chính (Đối chiếu đúng tên Phòng ban/Nhà máy/Nhân sự từ Danh bạ THACO hoặc tên Đối tác)",
-      "phoi_hop": "Đơn vị / Cá nhân phối hợp (Ghi '-' nếu không có)",
+      "trach_nhiem": "Đơn vị / Nhân sự chịu trách nhiệm chính (BẮT BUỘC đối chiếu đúng tên Phòng ban/Nhà máy/Nhân sự tham gia hoặc Đối tác)",
+      "phoi_hop": "Đơn vị / Nhân sự phối hợp (Ghi '-' nếu không có)",
       "hoan_thanh": "Thời hạn hoàn thành (VD: 20/11/2026 hoặc Hằng tuần)"
     }
   ],
@@ -999,16 +1128,16 @@ with tab2:
 }
 Lưu ý: Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown ```json.""",
 
-        "2. Họp Đàm phán Đối tác Quốc tế / Nhà cung cấp (BJM, Foton, Hyundai...)": """Đóng vai Chủ trì / Thư ký kỹ thuật Phòng QLCL KCN - THACO AUTO làm việc với đối tác quốc tế/NCC. Hãy đối chiếu Danh bạ Nhân sự và Bảng thuật ngữ THACO để bóc tách từng vấn đề kỹ thuật, bảo hành, chất lượng xe thành JSON chuẩn 7 cột:
+            "2. Họp Đàm phán Đối tác Quốc tế / Nhà cung cấp (BJM, Foton, Hyundai...)": """Đóng vai Chủ trì / Thư ký kỹ thuật Phòng QLCL KCN - THACO AUTO làm việc với đối tác quốc tế/NCC. Hãy đối chiếu Danh sách Nhân sự tham dự, Cấu trúc Mẫu BBH và Bảng thuật ngữ THACO để bóc tách từng vấn đề kỹ thuật, bảo hành, chất lượng xe thành JSON chuẩn 7 cột:
 {
   "ve_viec": "Họp đánh giá chất lượng xe và giải quyết khiếu nại kỹ thuật với đối tác",
   "rows": [
     {
       "tt": "1",
       "van_de": "Mô tả vấn đề / Khiếu nại chất lượng / Mã lỗi",
-      "noi_dung_thao_luan": "Ý kiến phản hồi của đối tác/NCC và đánh giá kỹ thuật của đại diện THACO",
+      "noi_dung_thao_luan": "Ý kiến phản hồi của đối tác/NCC và đánh giá kỹ thuật của đại diện THACO tham dự họp",
       "cong_viec_tiep_theo": "Hành động khắc phục, cung cấp phụ tùng hoặc lập báo cáo kỹ thuật",
-      "trach_nhiem": "Tên Đối tác / Đơn vị phụ trách",
+      "trach_nhiem": "Tên Đối tác / Đơn vị phụ trách chính",
       "phoi_hop": "Đơn vị phối hợp",
       "hoan_thanh": "Thời hạn hoàn thành"
     }
@@ -1016,12 +1145,16 @@ Lưu ý: Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự 
   "ket_luan_chung": "Trên đây là các thống nhất, chỉ đạo và triển khai trong cuộc họp, đề nghị các phòng ban, các Nhà máy triển khai thực hiện theo tiến độ, Phòng QLCL KCN làm đầu mối tổng hợp, theo dõi và báo cáo tiến độ thực hiện theo định kỳ."
 }
 Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown."""
-    }
+        }
 
-    selected_tpl = st.selectbox("📌 Chọn kịch bản Prompt Recap:", list(prompt_templates.keys()))
-    custom_prompt = st.text_area("✍️ Nội dung Prompt giao cho AI:", value=prompt_templates[selected_tpl], height=175)
+        selected_tpl = st.selectbox("Kịch bản Prompt:", list(prompt_templates.keys()), label_visibility="collapsed")
+        custom_prompt = st.text_area("Nội dung Prompt chi tiết:", value=prompt_templates[selected_tpl], height=160)
 
-    if st.button(f"✨ Chạy AI Recap Với Danh Bạ Nhân Sự & Model `{selected_recap_model}`", type="primary", use_container_width=True):
+    if st.button(
+        f"✨ Chạy AI Recap Kết Hợp Danh Sách Nhân Sự Tham Dự & Form Mẫu BBH (`{selected_recap_model}`)",
+        type="primary",
+        use_container_width=True
+    ):
         if not gemini_api_key:
             st.error("Vui lòng nhập Gemini API Key ở thanh bên trái!")
         elif input_source_mode.startswith("🎙️") and not uploaded_audio_recap:
@@ -1029,11 +1162,17 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
         elif not input_source_mode.startswith("🎙️") and not text_for_recap.strip():
             st.warning("Chưa có dữ liệu văn bản cuộc họp để phân tích!")
         else:
-            with st.spinner("AI đang phân tích cuộc họp, đối chiếu Bảng thuật ngữ & Danh bạ Nhân sự THACO..."):
+            with st.spinner("AI đang phân tích cuộc họp, đối chiếu Nhân sự tham gia, Cấu trúc Form BBH & Bảng thuật ngữ THACO..."):
                 try:
+                    template_ctx = (
+                        f"--- CẤU TRÚC MẪU BIÊN BẢN HỌP (.DOCX) ĐẦU VÀO ---\n{st.session_state.template_structure_hint}\n\n"
+                        if st.session_state.template_structure_hint else ""
+                    )
                     shared_context = (
-                        f"--- DANH SÁCH NHÂN SỰ, CHỨC DANH & PHÒNG BAN THACO ---\n"
-                        f"{json.dumps(st.session_state.personnel, ensure_ascii=False)}\n\n"
+                        f"--- DANH SÁCH NHÂN SỰ THACO THỰC TẾ THAM GIA CUỘC HỌP NÀY ---\n"
+                        f"{json.dumps(st.session_state.selected_attendees, ensure_ascii=False)}\n"
+                        f"Nhân sự / Đối tác bổ sung: {st.session_state.extra_attendees_str}\n\n"
+                        f"{template_ctx}"
                         f"--- BẢNG THUẬT NGỮ THACO DÙNG CHUNG ---\n"
                         f"{json.dumps(st.session_state.glossary, ensure_ascii=False)}\n\n"
                     )
@@ -1042,7 +1181,7 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
                         full_prompt = (
                             f"{custom_prompt}\n\n"
                             f"{shared_context}"
-                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm, nhận diện đúng tên nhân sự/chức danh/đơn vị và bóc tách chi tiết vào bảng JSON 7 cột."
+                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm, đối chiếu đúng nhân sự tham gia, thuật ngữ THACO và cấu trúc mẫu BBH để bóc tách chi tiết vào bảng JSON 7 cột."
                         )
                         raw_reply = generate_recap_with_audio_or_text(
                             gemini_api_key, selected_recap_model, full_prompt, audio_file=uploaded_audio_recap
@@ -1067,11 +1206,11 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
                     if parsed.get("rows") and isinstance(parsed["rows"], list):
                         st.session_state.recap_rows = parsed["rows"]
 
-                    st.success("✅ Đã phân tích thành công! Kiểm tra bảng 7 cột bên dưới và chuyển sang Bước 3 để xuất file Word trình ký.")
+                    st.success("✅ Đã phân tích thành công theo đúng Form mẫu & Nhân sự tham gia! Kiểm tra bảng bên dưới và bấm sang Bước 3 để tải Biên bản Word.")
                 except Exception as e:
                     st.error(f"Lỗi phân tích AI: {e}")
 
-    st.markdown("#### 🔍 Rà soát & Chỉnh sửa Bảng III: Nội dung thảo luận và kế hoạch triển khai")
+    st.markdown("##### 🔍 Rà soát & Chỉnh sửa Bảng III: Nội dung thảo luận và kế hoạch triển khai (Liên thông sang Bước 3)")
     edited_rows = st.data_editor(
         st.session_state.recap_rows,
         column_config={
@@ -1085,14 +1224,21 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
         },
         num_rows="dynamic",
         use_container_width=True,
-        height=260,
+        height=250,
         key="recap_table_editor"
     )
     st.session_state.recap_rows = edited_rows
 
 # ----------------- TAB 3: XUẤT BIÊN BẢN HỌP WORD TRÌNH KÝ -----------------
 with tab3:
-    st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Đúng Chuẩn Mẫu Phòng QLCL KCN - THACO AUTO")
+    st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Trình Ký Ngay")
+
+    if st.session_state.template_docx_bytes is not None:
+        st.success(
+            f"✅ Hệ thống đã nhận sẵn File Mẫu BBH **`{st.session_state.template_docx_name}`** và **{len(st.session_state.selected_attendees)} nhân sự tham gia** từ Bước 2. Anh chỉ cần kiểm tra thông tin hành chính bên dưới và bấm Kết xuất!"
+        )
+    else:
+        st.info("💡 Anh có thể tải File BBH Mẫu ở Bước 2 hoặc tải trực tiếp ở ô bên dưới. Nếu để trống, hệ thống sẽ tạo theo Form chuẩn của Phòng QLCL KCN - THACO AUTO.")
 
     col_m1, col_m2 = st.columns(2)
     with col_m1:
@@ -1102,21 +1248,8 @@ with tab3:
         st.session_state.bbh_meta["thoi_gian"] = st.text_input("I. Thời gian:", value=st.session_state.bbh_meta["thoi_gian"])
         st.session_state.bbh_meta["dia_diem"] = st.text_input("I. Địa điểm:", value=st.session_state.bbh_meta["dia_diem"])
 
-    st.markdown("#### 👥 Chọn Thành phần tham dự cuộc họp (Tự động chia cột theo Phòng ban/Nhà máy trong Bảng II của Word)")
-    all_p_labels = [
-        f"{p.get('ho_ten', '')} – {p.get('chuc_danh', '')} ({p.get('phong_ban', '')})"
-        for p in st.session_state.personnel
-    ]
-    selected_p_labels = st.multiselect(
-        "Tick chọn các nhân sự có mặt trong cuộc họp này (Lấy từ Google Sheets):",
-        options=all_p_labels,
-        default=all_p_labels
-    )
-    selected_personnel_objs = [
-        p for p, lbl in zip(st.session_state.personnel, all_p_labels) if lbl in selected_p_labels
-    ]
     update_att_flag = st.checkbox(
-        "Tự động điền danh sách nhân sự đã chọn ở trên vào Bảng II (Thành phần tham dự) trong file Word",
+        f"Tự động điền danh sách {len(st.session_state.selected_attendees)} nhân sự đã chọn ở Bước 2 vào Bảng II (Thành phần tham dự) trong file Word",
         value=True
     )
 
@@ -1126,26 +1259,31 @@ with tab3:
         height=70
     )
 
-    uploaded_docx = st.file_uploader(
-        "📂 Tải lên File BBH Mẫu của anh (VD: `2026-1113. BB họp chất lượng xe xuất khẩuV4 - Copy.docx`):",
-        type=["docx"]
+    uploaded_docx_step3 = st.file_uploader(
+        "📂 Tải lên File BBH Mẫu khác (Tùy chọn - nếu muốn thay đổi mẫu đã nạp ở Bước 2):",
+        type=["docx"],
+        key="uploader_tpl_step3"
     )
+    if uploaded_docx_step3 is not None:
+        st.session_state.template_docx_bytes = uploaded_docx_step3.getvalue()
+        st.session_state.template_docx_name = uploaded_docx_step3.name
 
     if st.button("🖨️ Kết Xuất Biên Bản Họp Word (.docx) Để Trình Ký Ngay", type="primary", use_container_width=True):
         try:
-            if uploaded_docx is not None:
+            active_attendees = st.session_state.selected_attendees or st.session_state.personnel
+            if st.session_state.template_docx_bytes is not None:
                 final_docx_bytes = populate_uploaded_thaco_docx(
-                    uploaded_docx.getvalue(),
+                    st.session_state.template_docx_bytes,
                     st.session_state.bbh_meta,
                     st.session_state.recap_rows,
-                    selected_personnel_objs,
+                    active_attendees,
                     update_attendance_table=update_att_flag
                 )
             else:
                 final_docx_bytes = generate_default_thaco_bbh_docx(
                     st.session_state.bbh_meta,
                     st.session_state.recap_rows,
-                    selected_personnel_objs
+                    active_attendees
                 )
 
             out_name = f"{datetime.now().strftime('%Y-%m%d')}. BB hop chat luong - QLCL KCN.docx"
@@ -1166,7 +1304,7 @@ with tab4:
     st.subheader("📚 Quản Trị Trực Tiếp Nhân Sự, Thuật Ngữ & Bộ Nhớ Dịch (Đồng Bộ Google Sheets)")
 
     st.markdown(f"### 👥 1. Danh Bạ Nhân Sự - Chức Danh - Phòng Ban (`Personnel`: {len(st.session_state.personnel)} nhân sự)")
-    st.caption("Thêm/sửa/xóa dòng trực tiếp bên dưới rồi bấm Lưu. Danh sách này sẽ xuất hiện ở ô chọn Người phát biểu (Bước 1), AI Recap (Bước 2) và Bảng Thành phần tham dự (Bước 3).")
+    st.caption("Thêm/sửa/xóa dòng trực tiếp bên dưới rồi bấm Lưu. Danh sách này sẽ đồng bộ ngay với các nút 1-Click ở Bước 1 và danh sách chọn người tham dự ở Bước 2.")
     p_list = st.session_state.personnel if st.session_state.personnel else [{"ho_ten": "", "chuc_danh": "", "phong_ban": ""}]
     edited_personnel = st.data_editor(
         p_list,
