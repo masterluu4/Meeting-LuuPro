@@ -4,40 +4,59 @@ import requests
 import json
 import io
 import re
-import tempfile
-import os
-import time
 from datetime import datetime
 import google.generativeai as genai
-from docxtpl import DocxTemplate
 from docx import Document
+from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 # ================= CẤU HÌNH TRANG =================
 st.set_page_config(page_title="THACO Smart Meeting & AI Biên Bản", page_icon="🚗", layout="wide")
 
-# Khởi tạo Session State
+# Khởi tạo Session State chuẩn theo đúng mẫu BBH Phòng QLCL KCN
 defaults = {
     "transcript_list": [],      # [{time, source, target, terms}]
     "raw_stream_input": "",     # Luồng văn bản đồng bộ từ Web Audio
     "glossary": {},             # Từ điển THACO dùng chung
     "tm": {},                   # Bộ nhớ dịch TM dùng chung
-    "is_synced": False,         # Trạng thái đã tải dữ liệu lần đầu
-    "available_models": [],     # Danh sách model lấy từ API Key
-    "recap_data": {
-        "tom_tat_chung": "",
-        "noi_dung_thao_luan": "",
-        "ket_luan_chi_dao": "",
-        "action_items": [
-            {"tt": "1", "cong_viec": "", "phu_trach": "", "thoi_han": "", "ghi_chu": ""}
-        ]
-    }
+    "is_synced": False,
+    "bbh_meta": {
+        "so_bbh": "…/2026/BBH – Phòng QLCL KCN",
+        "ve_viec": "Đánh giá chất lượng xe và giải quyết các vấn đề kỹ thuật sau bán hàng",
+        "thoi_gian": datetime.now().strftime("%H:%M ngày %d/%m/%Y"),
+        "dia_diem": "Họp trực tuyến qua Microsoft Teams / Phòng họp QLCL KCN",
+        "ket_luan_chung": "Trên đây là các thống nhất, chỉ đạo và triển khai trong cuộc họp, đề nghị các phòng ban, các Nhà máy triển khai thực hiện theo tiến độ, Phòng QLCL KCN làm đầu mối tổng hợp, theo dõi và báo cáo tiến độ thực hiện theo định kỳ."
+    },
+    "recap_rows": [
+        {
+            "tt": "1",
+            "van_de": "Đối với 04 báo cáo khiếu nại chưa có Báo cáo kỹ thuật từ BJM (chỉ có thông tin nhanh)",
+            "noi_dung_thao_luan": "BJM xác nhận xe của khách hàng cuối đang vận hành ở xa (không vào xưởng) nên chưa thể chụp hình và lập báo cáo kỹ thuật.",
+            "cong_viec_tiep_theo": "BJM sẽ theo dõi tình hình và cập nhật thông tin cho THACO trong tuần tiếp theo.",
+            "trach_nhiem": "BJM",
+            "phoi_hop": "-",
+            "hoan_thanh": "20/11/2026"
+        }
+    ]
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ================= HÀM LÀM SẠCH URL & KẾT NỐI GOOGLE SHEETS =================
+# ================= HÀM LÀM SẠCH API KEY & URL =================
+def clean_api_key(raw_key):
+    """Làm sạch khoảng trắng, dấu ngoặc kép/ngoặc vuông quanh API Key"""
+    if not raw_key:
+        return ""
+    s = str(raw_key).strip().strip("[]\"'() ")
+    # Ưu tiên bắt chuẩn Google Gemini API Key (AIza...)
+    match = re.search(r'AIza[0-9A-Za-z\-_]{35}', s)
+    if match:
+        return match.group(0)
+    return s
+
 def clean_webapp_url(raw_url):
     """Loại bỏ hoàn toàn dấu ngoặc vuông [], ngoặc kép, khoảng trắng bị dính khi copy/paste"""
     if not raw_url:
@@ -48,6 +67,7 @@ def clean_webapp_url(raw_url):
         return match.group(0)
     return s.strip("[]\"'() ")
 
+# ================= HÀM ĐỒNG BỘ GOOGLE SHEETS (CODE.GS) =================
 def sync_from_sheets(raw_url):
     webapp_url = clean_webapp_url(raw_url)
     if not webapp_url:
@@ -62,7 +82,7 @@ def sync_from_sheets(raw_url):
             return True, f"✅ Đã đồng bộ: {len(st.session_state.glossary)} thuật ngữ & {len(st.session_state.tm)} câu TM."
     except Exception as e:
         return False, f"❌ Lỗi kết nối Google Sheets: {e}"
-    return False, f"❌ Đường dẫn không phản hồi (HTTP {res.status_code})."
+    return False, f"❌ Đường dẫn không phản hồi."
 
 def save_full_glossary_to_sheets(raw_url, updated_glossary_dict):
     webapp_url = clean_webapp_url(raw_url)
@@ -73,7 +93,6 @@ def save_full_glossary_to_sheets(raw_url, updated_glossary_dict):
         cloud_glossary = {}
         if res_get.status_code == 200:
             cloud_glossary = res_get.json().get("glossary", {})
-        
         cloud_glossary.update(updated_glossary_dict)
         payload = {"action": "save_glossary", "data": cloud_glossary}
         res_post = requests.post(webapp_url, data=json.dumps(payload), timeout=12)
@@ -99,33 +118,31 @@ def upsert_tm_to_sheets(raw_url, new_tm_dict):
     except Exception as e:
         return False, f"❌ Lỗi kết nối: {e}"
 
-# ================= HÀM QUÉT MODEL KHẢ DỤNG & CHỌN MODEL TỐI ƯU =================
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_available_models(api_key):
-    """Lấy danh sách các model thực tế khả dụng với API Key của người dùng"""
+# ================= HÀM KIỂM TRA API KEY & QUÉT MODEL KHẢ DỤNG =================
+@st.cache_data(ttl=300, show_spinner=False)
+def validate_and_fetch_models(raw_key):
+    api_key = clean_api_key(raw_key)
     if not api_key:
-        return []
+        return False, [], "Chưa nhập API Key."
     try:
-        genai.configure(api_key=api_key.strip())
+        genai.configure(api_key=api_key)
         models = []
         for m in genai.list_models():
             if "generateContent" in m.supported_generation_methods:
-                name = m.name.replace("models/", "")
-                models.append(name)
-        return models
-    except Exception:
-        return []
+                models.append(m.name.replace("models/", ""))
+        if not models:
+            return False, [], "API Key không trả về model nào."
+        return True, models, f"API Key hợp lệ ({len(models)} model khả dụng)"
+    except Exception as e:
+        return False, [], f"API Key không hợp lệ: {e}"
 
 def pick_optimal_model(models_list, task="recap"):
-    """Tự động đề xuất model tối ưu: 'pro' cho Recap/Audio, 'flash' cho Dịch nhanh"""
     if not models_list:
         return "gemini-1.5-pro" if task == "recap" else "gemini-1.5-flash"
-    
     if task == "recap":
         priorities = ["gemini-2.5-pro", "gemini-1.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     else:
         priorities = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
-        
     for p in priorities:
         for m in models_list:
             if m == p or m.startswith(p):
@@ -133,7 +150,8 @@ def pick_optimal_model(models_list, task="recap"):
     return models_list[0]
 
 # ================= HÀM DỊCH THUẬT AI + SO KHỚP GLOSSARY & TM =================
-def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, model_name, raw_url=""):
+def translate_batch_with_thaco_memory(lines_with_time, mode, raw_key, model_name, raw_url=""):
+    api_key = clean_api_key(raw_key)
     results = []
     tm_to_upsert = {}
 
@@ -159,21 +177,14 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, model_name
                 matched[vn_term] = en_term
 
         if not api_key:
-            results.append({
-                "time": time_tag,
-                "source": clean_text,
-                "target": "[Chưa nhập Gemini API Key]",
-                "terms": list(matched.keys())
-            })
+            results.append({"time": time_tag, "source": clean_text, "target": "[Chưa nhập Gemini API Key]", "terms": list(matched.keys())})
             continue
 
         direction = "tiếng Anh sang tiếng Việt" if mode == "Anh -> Việt" else "tiếng Việt sang tiếng Anh"
-        glossary_instruction = ""
-        if matched:
-            glossary_instruction = f"BẮT BUỘC sử dụng đúng thuật ngữ chuyên ngành THACO sau: {json.dumps(matched, ensure_ascii=False)}. "
+        glossary_instruction = f"BẮT BUỘC dùng đúng thuật ngữ THACO sau: {json.dumps(matched, ensure_ascii=False)}. " if matched else ""
 
         try:
-            genai.configure(api_key=api_key.strip())
+            genai.configure(api_key=api_key)
             model = genai.GenerativeModel(model_name)
             prompt = (
                 f"Bạn là chuyên gia phiên dịch kỹ thuật và quản lý chất lượng của THACO AUTO. "
@@ -183,60 +194,169 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, model_name
             )
             res = model.generate_content(prompt)
             translated = res.text.strip()
-
-            results.append({
-                "time": time_tag,
-                "source": clean_text,
-                "target": translated,
-                "terms": list(matched.keys())
-            })
-
+            results.append({"time": time_tag, "source": clean_text, "target": translated, "terms": list(matched.keys())})
             if len(clean_text.split()) >= 3:
                 tm_to_upsert[clean_text] = translated
-
         except Exception as e:
             results.append({"time": time_tag, "source": clean_text, "target": f"[Lỗi AI: {e}]", "terms": []})
 
     if raw_url and tm_to_upsert:
         upsert_tm_to_sheets(raw_url, tm_to_upsert)
-
     return results
 
-# ================= HÀM TẠO FILE WORD MẪU CHUẨN TRÌNH KÝ =================
-def generate_sample_docx():
+# ================= HÀM ĐIỀN TRỰC TIẾP VÀO FILE WORD MẪU BBH THACO =================
+def set_cell_border(cell):
+    """Kẻ khung viền chuẩn cho ô bảng mới thêm vào Word"""
+    tcPr = cell._tc.get_or_add_tcPr()
+    tcBorders = OxmlElement('w:tcBorders')
+    for border_name in ['top', 'left', 'bottom', 'right']:
+        border = OxmlElement(f'w:{border_name}')
+        border.set(qn('w:val'), 'single')
+        border.set(qn('w:sz'), '4')
+        border.set(qn('w:space'), '0')
+        border.set(qn('w:color'), '000000')
+        tcBorders.append(border)
+    tcPr.append(tcBorders)
+
+def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
+    """
+    Điền trực tiếp vào file '2026-1113. BB họp chất lượng xe xuất khẩuV4.docx' của anh
+    mà KHÔNG cần sửa mẫu trước. Giữ nguyên 100% Logo, Header, Bảng thành phần và Bảng chữ ký!
+    """
+    doc = Document(io.BytesIO(template_file_bytes))
+
+    # 1. Cập nhật Số BBH trong bảng Header (Bảng đầu tiên nếu có chữ 'Số:')
+    if len(doc.tables) >= 1:
+        header_tbl = doc.tables[0]
+        for row in header_tbl.rows:
+            for cell in row.cells:
+                if "Số:" in cell.text or "BBH" in cell.text:
+                    for p in cell.paragraphs:
+                        if "Số:" in p.text or "BBH" in p.text:
+                            p.text = f"Số: {meta['so_bbh']}"
+                            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # 2. Cập nhật các dòng V/v, Thời gian, Địa điểm, Kết luận trong các đoạn văn (Paragraphs)
+    for p in doc.paragraphs:
+        txt = p.text.strip()
+        if txt.startswith("V/v:") or txt.startswith("V/v :"):
+            p.text = f"V/v: {meta['ve_viec']}"
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            for run in p.runs:
+                run.bold = True
+        elif txt.startswith("Thời gian:"):
+            p.text = f"Thời gian: {meta['thoi_gian']}"
+        elif txt.startswith("Địa điểm:"):
+            p.text = f"Địa điểm: {meta['dia_diem']}"
+        elif txt.startswith("Trên đây là các thống nhất"):
+            p.text = meta["ket_luan_chung"]
+
+    # 3. Tìm đúng Bảng 7 cột 'Nội dung thảo luận và kế hoạch triển khai' (TT | Vấn đề | Nội dung thảo luận...)
+    target_table = None
+    for tbl in doc.tables:
+        if len(tbl.columns) >= 6 and len(tbl.rows) >= 1:
+            header_text = " ".join([c.text.strip().lower() for c in tbl.rows[0].cells])
+            if "vấn đề" in header_text or "thảo luận" in header_text or "tt" in header_text:
+                target_table = tbl
+                break
+
+    # Fallback: Nếu mẫu có đúng 4 bảng chuẩn như file anh đính kèm, bảng nội dung là bảng số 3 (index 2)
+    if target_table is None and len(doc.tables) >= 3:
+        for tbl in doc.tables:
+            if len(tbl.columns) == 7:
+                target_table = tbl
+                break
+
+    if target_table is not None:
+        # Xóa toàn bộ các dòng dữ liệu cũ bên dưới dòng tiêu đề (giữ lại row 0 làm Header)
+        while len(target_table.rows) > 1:
+            tbl_element = target_table._tbl
+            tr_element = target_table.rows[1]._tr
+            tbl_element.remove(tr_element)
+
+        # Đổ từng dòng từ kết quả AI Recap (Mục 2) vào bảng
+        for idx, item in enumerate(recap_rows, 1):
+            row_cells = target_table.add_row().cells
+            values = [
+                str(item.get("tt") or idx),
+                str(item.get("van_de", "")),
+                str(item.get("noi_dung_thao_luan", "")),
+                str(item.get("cong_viec_tiep_theo", "")),
+                str(item.get("trach_nhiem", "")),
+                str(item.get("phoi_hop", "-")),
+                str(item.get("hoan_thanh", ""))
+            ]
+            for c_idx in range(min(len(row_cells), 7)):
+                row_cells[c_idx].text = values[c_idx]
+                set_cell_border(row_cells[c_idx])
+                # Căn giữa cho cột TT, Trách nhiệm, Phối hợp, Hoàn thành
+                if c_idx in [0, 4, 5, 6]:
+                    for p in row_cells[c_idx].paragraphs:
+                        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    out_bio = io.BytesIO()
+    doc.save(out_bio)
+    out_bio.seek(0)
+    return out_bio.getvalue()
+
+def generate_default_thaco_bbh_docx(meta, recap_rows):
+    """Tạo sẵn file Word chuẩn bố cục Phòng QLCL KCN - THACO AUTO nếu người dùng chưa tải file mẫu lên"""
     doc = Document()
-    title = doc.add_heading("BIÊN BẢN CUỘC HỌP", level=1)
-    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    p_info = doc.add_paragraph()
-    p_info.add_run("1. Tên cuộc họp: ").bold = True
-    p_info.add_run("{{ten_cuoc_hop}}\n")
-    p_info.add_run("2. Thời gian: ").bold = True
-    p_info.add_run("{{ngay_hop}}\n")
-    p_info.add_run("3. Địa điểm / Hình thức: ").bold = True
-    p_info.add_run("{{dia_diem}}\n")
-    p_info.add_run("4. Chủ trì: ").bold = True
-    p_info.add_run("{{chu_tri}}\n")
-    p_info.add_run("5. Thành phần tham dự: ").bold = True
-    p_info.add_run("{{thanh_phan}}")
+    # Bảng 1: Header Công ty & Số hiệu
+    hdr_table = doc.add_table(rows=1, cols=2)
+    hdr_table.cell(0, 0).text = "CÔNG TY TNHH THACO AUTO"
+    hdr_table.cell(0, 1).text = f"Số: {meta['so_bbh']}"
+    
+    title = doc.add_heading("BIÊN BẢN HỌP", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p_vv = doc.add_paragraph(f"V/v: {meta['ve_viec']}")
+    p_vv.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    doc.add_heading("I. TÓM TẮT MỤC TIÊU & BỐI CẢNH", level=2)
-    doc.add_paragraph("{{tom_tat_chung}}")
+    doc.add_heading("I. Thời gian, địa điểm:", level=2)
+    doc.add_paragraph(f"Thời gian: {meta['thoi_gian']}\nĐịa điểm: {meta['dia_diem']}")
 
-    doc.add_heading("II. NỘI DUNG THẢO LUẬN CHI TIẾT", level=2)
-    doc.add_paragraph("{{noi_dung_thao_luan}}")
+    doc.add_heading("II. Thành phần tham dự:", level=2)
+    att_tbl = doc.add_table(rows=3, cols=3)
+    att_data = [
+        ["Phòng QLCL KCN", "Nhà máy Tải & Bus", "Phòng KD Xuất khẩu"],
+        ["Ông Nguyễn Thiện Đức – PGĐ.QLCL Ô tô & LKPT KCN", "Ông Nguyễn Ngọc Sinh – TBP KTCL NM Bus", "Ông Trần Đình Quang – TP Khối KD Xuất khẩu"],
+        ["Ông Võ Thành Lưu – TP QLCL xe Thương mại", "Ông Bùi Quang Trung – TBP KTCL NM Tải", "Cùng các nhân sự có liên quan."]
+    ]
+    for r_i, r_val in enumerate(att_data):
+        for c_i, c_val in enumerate(r_val):
+            att_tbl.cell(r_i, c_i).text = c_val
+            set_cell_border(att_tbl.cell(r_i, c_i))
 
-    doc.add_heading("III. KẾT LUẬN & CHỈ ĐẠO CỦA CHỦ TRÌ", level=2)
-    doc.add_paragraph("{{ket_luan_chi_dao}}")
+    doc.add_heading("III. Nội dung thảo luận và kế hoạch triển khai thực hiện:", level=2)
+    main_tbl = doc.add_table(rows=1, cols=7)
+    headers = ["TT", "Vấn đề", "Nội dung thảo luận", "Công việc thực hiện tiếp theo", "T.nhiệm", "P.hợp", "H.thành"]
+    for i, h in enumerate(headers):
+        main_tbl.rows[0].cells[i].text = h
+        set_cell_border(main_tbl.rows[0].cells[i])
 
-    doc.add_heading("IV. KẾ HOẠCH HÀNH ĐỘNG & PHÂN CÔNG", level=2)
-    doc.add_paragraph("{{ke_hoach_hanh_dong}}")
+    for idx, item in enumerate(recap_rows, 1):
+        row_cells = main_tbl.add_row().cells
+        vals = [
+            str(item.get("tt") or idx),
+            str(item.get("van_de", "")),
+            str(item.get("noi_dung_thao_luan", "")),
+            str(item.get("cong_viec_tiep_theo", "")),
+            str(item.get("trach_nhiem", "")),
+            str(item.get("phoi_hop", "-")),
+            str(item.get("hoan_thanh", ""))
+        ]
+        for i in range(7):
+            row_cells[i].text = vals[i]
+            set_cell_border(row_cells[i])
 
-    sign_table = doc.add_table(rows=2, cols=2)
-    sign_table.cell(0, 0).paragraphs[0].add_run("NGƯỜI LẬP BIÊN BẢN").bold = True
-    sign_table.cell(0, 1).paragraphs[0].add_run("CHỦ TRÌ CUỘC HỌP PHÊ DUYỆT").bold = True
-    sign_table.cell(1, 0).paragraphs[0].add_run("\n\n\n{{nguoi_lap}}")
-    sign_table.cell(1, 1).paragraphs[0].add_run("\n\n\n{{chu_tri}}")
+    doc.add_paragraph("\n" + meta["ket_luan_chung"])
+
+    sign_tbl = doc.add_table(rows=2, cols=4)
+    sign_headers = ["Khối KD Xuất khẩu", "Nhà máy Bus", "Nhà máy Tải", "P.QLCL KCN"]
+    for i, sh in enumerate(sign_headers):
+        sign_tbl.cell(0, i).text = sh
+        sign_tbl.cell(1, i).text = "\n\n\n"
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -250,40 +370,40 @@ with st.sidebar:
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     default_url = st.secrets.get("WEBAPP_URL", "") if "WEBAPP_URL" in st.secrets else ""
 
-    gemini_api_key = st.text_input("🔑 1. Gemini API Key:", value=default_key, type="password")
+    raw_api_key_input = st.text_input("🔑 1. Gemini API Key (Bắt đầu bằng AIza...):", value=default_key, type="password")
+    gemini_api_key = clean_api_key(raw_api_key_input)
     
-    # Quét danh sách Model khả dụng ngay khi có API Key
     if gemini_api_key:
-        models_list = fetch_available_models(gemini_api_key)
-        if models_list:
-            st.success(f"✅ API Key hợp lệ ({len(models_list)} model khả dụng)")
+        if not gemini_api_key.startswith("AIza"):
+            st.warning("⚠️ Chú ý: Mã Key bạn đang dán (`AQ...`) không có định dạng chuẩn `AIzaSy...` của Google AI Studio. Nếu gặp lỗi 400, hãy lấy Key chuẩn tại aistudio.google.com/app/apikey")
+        is_valid, models_list, key_msg = validate_and_fetch_models(gemini_api_key)
+        if is_valid:
+            st.success(f"✅ {key_msg}")
             opt_recap = pick_optimal_model(models_list, task="recap")
             opt_trans = pick_optimal_model(models_list, task="translate")
             
             selected_recap_model = st.selectbox(
-                "🧠 Model AI cho Recap & Nghe File Âm Thanh (Tối ưu):",
+                "🧠 Model AI cho Recap & Nghe File Âm Thanh:",
                 options=models_list,
-                index=models_list.index(opt_recap) if opt_recap in models_list else 0,
-                help="Hệ thống đã tự động chọn model mạnh nhất (Pro/Flash) cho phân tích sâu và nghe file ghi âm."
+                index=models_list.index(opt_recap) if opt_recap in models_list else 0
             )
             selected_trans_model = st.selectbox(
                 "⚡ Model AI cho Dịch Phụ Đề Nhanh:",
                 options=models_list,
-                index=models_list.index(opt_trans) if opt_trans in models_list else 0,
-                help="Hệ thống tự động chọn dòng Flash để dịch nhanh theo thời gian thực."
+                index=models_list.index(opt_trans) if opt_trans in models_list else 0
             )
         else:
-            st.error("❌ Không lấy được danh sách Model. Vui lòng kiểm tra lại API Key.")
+            st.error(f"❌ {key_msg}")
             selected_recap_model = "gemini-1.5-pro"
             selected_trans_model = "gemini-1.5-flash"
     else:
-        st.caption("Nhập API Key để hệ thống hiển thị các Model khả dụng.")
+        st.caption("Nhập Gemini API Key để hiển thị danh sách Model.")
         selected_recap_model = "gemini-1.5-pro"
         selected_trans_model = "gemini-1.5-flash"
 
     st.divider()
-    raw_webapp_Input = st.text_input("☁️ 2. Link Google Apps Script (Dùng chung):", value=default_url)
-    webapp_url = clean_webapp_url(raw_webapp_Input)
+    raw_webapp_input = st.text_input("☁️ 2. Link Google Apps Script (Dùng chung):", value=default_url)
+    webapp_url = clean_webapp_url(raw_webapp_input)
     
     if webapp_url and not st.session_state.is_synced:
         ok, msg = sync_from_sheets(webapp_url)
@@ -325,7 +445,7 @@ st.title("🚗 Hệ Thống Trợ Lý Họp, Dịch Thuật Real-time & Xuất B
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎙️ Bước 1: Thu Âm VB-Cable & Phụ Đề",
-    "🧠 Bước 2: AI Recap (Từ File Ghi Âm / .TXT)",
+    "🧠 Bước 2: AI Recap (Chuẩn Bảng 7 Cột BBH THACO)",
     "📄 Bước 3: Xuất Biên Bản Word Trình Ký",
     "📚 Quản Trị Kho TM / Glossary Chung"
 ])
@@ -335,7 +455,7 @@ with tab1:
     st.info(
         "🔊 **Thiết lập chuẩn với VB-Audio Virtual Cable:** "
         "Trong cài đặt âm thanh của **MS Teams / Zoom / VooV**, chọn Loa (Speaker) là `CABLE Input`. "
-        "Khi kết thúc thu âm, anh có thể tải trực tiếp **File Ghi Âm Gốc (`.webm`)** hoặc **File Phụ Đề (`.txt`)** để đưa thẳng sang Bước 2 làm đầu vào Recap."
+        "Sau khi bấm **Dừng**, anh tải **File Ghi Âm (`.webm`)** hoặc **File Phụ Đề (`.txt`)** để đưa sang Bước 2 phân tích."
     )
 
     speech_lang = "en-US" if trans_mode == "Anh -> Việt" else "vi-VN"
@@ -366,7 +486,7 @@ with tab1:
       </div>
 
       <div style="margin-top:10px; display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:12px; color:#475569;">✨ Sau khi bấm <b>Dừng</b>, anh có thể tải File Ghi Âm hoặc File .TXT ở thanh trên để đưa sang Bước 2 Recap, hoặc Copy nhanh bên dưới:</span>
+        <span style="font-size:12px; color:#475569;">✨ Sau khi bấm <b>Dừng</b>, anh có thể tải File Ghi Âm hoặc File .TXT ở thanh trên để đưa sang Bước 2 Recap:</span>
         <button onclick="copyTranscript()" style="background:#0284c7; color:white; border:none; padding:7px 14px; border-radius:6px; font-weight:bold; cursor:pointer;">📋 Copy toàn bộ nội dung họp</button>
       </div>
       <textarea id="fullBuffer" style="width:100%; height:85px; margin-top:6px; border-radius:6px; border:1px solid #cbd5e1; padding:8px; font-size:13px;" placeholder="Nội dung phụ đề kèm mốc thời gian sẽ tự động ghi vào đây..."></textarea>
@@ -548,7 +668,7 @@ with tab1:
         raw_input_box = st.text_area(
             "📥 Dán nội dung cuộc họp vừa Copy (hoặc nhập câu cần dịch):",
             value=st.session_state.raw_stream_input,
-            height=220,
+            height=210,
             placeholder="[09:15:20] We need to check the warranty policy for CBU units..."
         )
         if st.button(f"🚀 Dịch Chuẩn Hóa ({selected_trans_model}) & Đẩy Lên TM", type="primary", use_container_width=True):
@@ -579,10 +699,10 @@ with tab1:
                     "time": st.column_config.TextColumn("Thời gian", width="small", disabled=True),
                     "source": st.column_config.TextColumn("Câu gốc (Khoa_Goc)", width="medium"),
                     "target": st.column_config.TextColumn("Bản Dịch Chuẩn (Ban_Dich_Chuan)", width="large"),
-                    "terms": st.column_config.ListColumn("Thuật ngữ áp dụng", width="small")
+                    "terms": st.column_config.ListColumn("Thuật ngữ", width="small")
                 },
                 use_container_width=True,
-                height=210,
+                height=200,
                 key="sub_editor"
             )
             st.session_state.transcript_list = edited_subtitles
@@ -597,14 +717,14 @@ with tab1:
         else:
             st.info("Chưa có dữ liệu dịch. Hãy bấm nút Dịch bên trái để hiển thị bảng hiệu đính.")
 
-# ----------------- TAB 2: AI RECAP TỪ FILE GHI ÂM HOẶC FILE .TXT -----------------
+# ----------------- TAB 2: AI RECAP CHUẨN BẢNG 7 CỘT BBH THACO -----------------
 with tab2:
-    st.subheader(f"🧠 Tổng Hợp & Phân Tích Cuộc Họp (Model đang chọn: `{selected_recap_model}`)")
+    st.subheader(f"🧠 Tổng Hợp Nội Dung Họp Theo Chuẩn Bảng 7 Cột BBH THACO (`{selected_recap_model}`)")
 
     input_source_mode = st.radio(
         "📂 Chọn nguồn đầu vào cho AI Recap:",
         [
-            "🎙️ 1. Dùng File Ghi Âm (.webm / .wav / .mp3 / .m4a) tải về từ Bước 1 (AI nghe trực tiếp cuộc họp - Chuẩn xác nhất)",
+            "🎙️ 1. Dùng File Ghi Âm (.webm / .wav / .mp3 / .m4a) tải về từ Bước 1 (Truyền trực tiếp Inline Audio Bytes - Không lỗi Upload)",
             "📄 2. Dùng File Phụ Đề (.txt) tải về từ Bước 1",
             "📝 3. Dùng trực tiếp văn bản đã dịch / dán ở Bước 1"
         ]
@@ -628,7 +748,7 @@ with tab2:
         )
         if uploaded_txt_recap:
             text_for_recap = uploaded_txt_recap.read().decode("utf-8", errors="ignore")
-            st.text_area("Nội dung trong file .txt:", value=text_for_recap, height=130)
+            st.text_area("Nội dung trong file .txt:", value=text_for_recap, height=120)
     else:
         combined_transcript = "\n".join(
             [f"[{x['time']}] {x['target']} (Gốc: {x['source']})" for x in st.session_state.transcript_list]
@@ -636,46 +756,49 @@ with tab2:
         text_for_recap = st.text_area(
             "Nội dung văn bản cuộc họp:",
             value=combined_transcript,
-            height=140
+            height=130
         )
 
     prompt_templates = {
-        "1. Họp Xử lý lỗi Kỹ thuật & Chất lượng sau bán hàng (Khuyên dùng)": """Đóng vai Trưởng bộ phận Quản lý Chất lượng tại THACO AUTO. Dựa vào toàn bộ nội dung cuộc họp và bảng thuật ngữ THACO, hãy phân tích kỹ lưỡng và xuất ra định dạng JSON chuẩn với đúng các trường sau:
+        "1. Mẫu chuẩn Biên Bản Họp Phòng QLCL KCN - THACO AUTO (7 cột chuẩn)": """Đóng vai Trưởng Phòng Quản lý Chất lượng (Phòng QLCL KCN - THACO AUTO). Dựa vào toàn bộ nội dung cuộc họp và bảng thuật ngữ THACO, hãy tổng hợp nội dung thảo luận và kế hoạch triển khai thành định dạng JSON chuẩn để đổ trực tiếp vào mẫu Biên Bản Họp của công ty:
 {
-  "tom_tat_chung": "Tóm tắt mục tiêu cuộc họp, dòng xe/linh kiện liên quan và bối cảnh vấn đề (3-5 câu)",
-  "noi_dung_thao_luan": "Phân tích chi tiết: (1) Hiện tượng & Số liệu thực tế, (2) Phân tích nguyên nhân gốc rễ (Root Cause), (3) Đối sách xử lý tạm thời và lâu dài",
-  "ket_luan_chi_dao": "Các quyết định và chỉ đạo chốt của người chủ trì cuộc họp",
-  "action_items": [
-    {"tt": "1", "cong_viec": "Tên đầu việc cụ thể", "phu_trach": "Đơn vị / Cá nhân", "thoi_han": "Thời hạn hoàn thành", "ghi_chu": "Yêu cầu báo cáo"}
-  ]
+  "ve_viec": "Tóm tắt chủ đề cuộc họp ngắn gọn (1 dòng để điền vào mục V/v: ...)",
+  "rows": [
+    {
+      "tt": "1",
+      "van_de": "Tên vấn đề / Hạng mục lỗi / Báo cáo khiếu nại cụ thể",
+      "noi_dung_thao_luan": "Chi tiết nội dung các bên đã thảo luận, nguyên nhân, hiện trạng kỹ thuật",
+      "cong_viec_tiep_theo": "Đối sách, công việc thực hiện tiếp theo cụ thể, rõ ràng",
+      "trach_nhiem": "Đơn vị / Cá nhân chịu trách nhiệm chính (VD: BJM, NM Tải, NM Bus, P.QLCL KCN...)",
+      "phoi_hop": "Đơn vị phối hợp (Ghi '-' nếu không có)",
+      "hoan_thanh": "Thời hạn hoàn thành (VD: 20/11/2026 hoặc Hằng tuần)"
+    }
+  ],
+  "ket_luan_chung": "Câu kết luận chỉ đạo chung cuối biên bản"
 }
-Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.""",
+Lưu ý: Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown ```json.""",
 
-        "2. Họp Đàm phán Đối tác Quốc tế / Nhà cung cấp (NCC)": """Đóng vai Thư ký Đối ngoại Kỹ thuật của THACO AUTO. Hãy tổng hợp nội dung làm việc với đối tác/NCC thành JSON chuẩn gồm các trường:
+        "2. Họp Đàm phán Đối tác Quốc tế / Nhà cung cấp (BJM, Foton, Hyundai...)": """Đóng vai Chủ trì / Thư ký kỹ thuật Phòng QLCL KCN - THACO AUTO làm việc với đối tác quốc tế/NCC. Hãy bóc tách từng vấn đề kỹ thuật, bảo hành, chất lượng xe xuất khẩu/CKD thành JSON chuẩn 7 cột sau:
 {
-  "tom_tat_chung": "Mục đích buổi làm việc với đối tác/NCC và các nội dung chính đã trao đổi",
-  "noi_dung_thao_luan": "Chi tiết các cam kết kỹ thuật, chính sách bảo hành, tiến độ cung ứng hoặc chuyển giao công nghệ",
-  "ket_luan_chi_dao": "Các thỏa thuận đã thống nhất giữa hai bên và các điểm còn chờ xác nhận",
-  "action_items": [
-    {"tt": "1", "cong_viec": "Hạng mục cần thực hiện", "phu_trach": "THACO / Đối tác", "thoi_han": "Deadline", "ghi_chu": "Ghi chú"}
-  ]
-}
-Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.""",
-
-        "3. Họp Giao ban Điều hành & Tiến độ Dự án": """Đóng vai Thư ký Ban Lãnh Đạo. Hãy tóm tắt cuộc họp giao ban thành JSON chuẩn gồm các trường:
-{
-  "tom_tat_chung": "Đánh giá tổng quan kết quả thực hiện công việc và mục tiêu trọng tâm kỳ tới",
-  "noi_dung_thao_luan": "Báo cáo của từng bộ phận, các vướng mắc phát sinh và giải pháp tháo gỡ",
-  "ket_luan_chi_dao": "Ý kiến chỉ đạo chốt của Lãnh đạo chủ trì",
-  "action_items": [
-    {"tt": "1", "cong_viec": "Nhiệm vụ trọng tâm", "phu_trach": "Phòng/Ban phụ trách", "thoi_han": "Thời hạn", "ghi_chu": "Ghi chú"}
-  ]
+  "ve_viec": "Họp đánh giá chất lượng xe và giải quyết khiếu nại kỹ thuật với đối tác",
+  "rows": [
+    {
+      "tt": "1",
+      "van_de": "Mô tả vấn đề / Khiếu nại chất lượng / Mã lỗi",
+      "noi_dung_thao_luan": "Ý kiến phản hồi của đối tác/NCC và đánh giá kỹ thuật của THACO",
+      "cong_viec_tiep_theo": "Hành động khắc phục, cung cấp phụ tùng hoặc lập báo cáo kỹ thuật",
+      "trach_nhiem": "Tên Đối tác / Đơn vị",
+      "phoi_hop": "Đơn vị phối hợp",
+      "hoan_thanh": "Thời hạn hoàn thành"
+    }
+  ],
+  "ket_luan_chung": "Trên đây là các thống nhất, chỉ đạo và triển khai trong cuộc họp, đề nghị các phòng ban, các Nhà máy triển khai thực hiện theo tiến độ, Phòng QLCL KCN làm đầu mối tổng hợp, theo dõi và báo cáo tiến độ thực hiện theo định kỳ."
 }
 Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown."""
     }
 
-    selected_tpl = st.selectbox("📌 Chọn kịch bản Prompt Recap (hoặc chỉnh sửa trực tiếp bên dưới):", list(prompt_templates.keys()))
-    custom_prompt = st.text_area("✍️ Nội dung Prompt giao cho AI:", value=prompt_templates[selected_tpl], height=160)
+    selected_tpl = st.selectbox("📌 Chọn kịch bản Prompt Recap (Chuẩn hóa theo mẫu BBH Phòng QLCL KCN):", list(prompt_templates.keys()))
+    custom_prompt = st.text_area("✍️ Nội dung Prompt giao cho AI (Có thể chỉnh sửa tùy tính chất cuộc họp):", value=prompt_templates[selected_tpl], height=180)
 
     if st.button(f"✨ Chạy AI Recap Với Model `{selected_recap_model}`", type="primary", use_container_width=True):
         if not gemini_api_key:
@@ -685,36 +808,32 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
         elif not input_source_mode.startswith("🎙️") and not text_for_recap.strip():
             st.warning("Chưa có dữ liệu văn bản cuộc họp để phân tích!")
         else:
-            with st.spinner(f"Model {selected_recap_model} đang xử lý dữ liệu cuộc họp và đối chiếu Bảng thuật ngữ THACO..."):
+            with st.spinner(f"Model {selected_recap_model} đang nghe/phân tích và bóc tách vào bảng 7 cột chuẩn BBH THACO..."):
                 try:
-                    genai.configure(api_key=gemini_api_key.strip())
+                    genai.configure(api_key=gemini_api_key)
                     model = genai.GenerativeModel(selected_recap_model)
                     glossary_context = f"--- BẢNG THUẬT NGỮ THACO DÙNG CHUNG ---\n{json.dumps(st.session_state.glossary, ensure_ascii=False)}\n\n"
 
                     if input_source_mode.startswith("🎙️"):
-                        # Xử lý File Ghi Âm trực tiếp qua Gemini File API
-                        suffix = "." + uploaded_audio_recap.name.split(".")[-1]
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-                            tmp_file.write(uploaded_audio_recap.getvalue())
-                            tmp_path = tmp_file.name
-                        
-                        gemini_audio_file = genai.upload_file(path=tmp_path)
-                        # Chờ file audio sẵn sàng
-                        while gemini_audio_file.state.name == "PROCESSING":
-                            time.sleep(1)
-                            gemini_audio_file = genai.get_file(gemini_audio_file.name)
-
+                        # Truyền trực tiếp Byte âm thanh (Inline Audio Part) - Không dùng genai.upload_file để tránh lỗi HttpError 400
+                        ext = uploaded_audio_recap.name.split(".")[-1].lower()
+                        mime_map = {
+                            "webm": "audio/webm",
+                            "wav": "audio/wav",
+                            "mp3": "audio/mp3",
+                            "m4a": "audio/mp4",
+                            "ogg": "audio/ogg"
+                        }
+                        audio_part = {
+                            "mime_type": mime_map.get(ext, "audio/webm"),
+                            "data": uploaded_audio_recap.getvalue()
+                        }
                         full_prompt = (
                             f"{custom_prompt}\n\n"
                             f"{glossary_context}"
-                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm (có thể gồm tiếng Việt và tiếng Anh) và tổng hợp chính xác theo cấu trúc JSON đã yêu cầu."
+                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm và bóc tách chi tiết vào bảng JSON 7 cột theo yêu cầu."
                         )
-                        res = model.generate_content([gemini_audio_file, full_prompt])
-                        try:
-                            genai.delete_file(gemini_audio_file.name)
-                            os.remove(tmp_path)
-                        except Exception:
-                            pass
+                        res = model.generate_content([full_prompt, audio_part])
                     else:
                         full_prompt = (
                             f"{custom_prompt}\n\n"
@@ -725,120 +844,88 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
 
                     cleaned = res.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                     parsed = json.loads(cleaned)
-                    st.session_state.recap_data = {
-                        "tom_tat_chung": parsed.get("tom_tat_chung", ""),
-                        "noi_dung_thao_luan": parsed.get("noi_dung_thao_luan", ""),
-                        "ket_luan_chi_dao": parsed.get("ket_luan_chi_dao", ""),
-                        "action_items": parsed.get("action_items", [])
-                    }
-                    st.success("✅ Đã Recap thành công! Toàn bộ nội dung dưới đây đã sẵn sàng để xuất sang Biên bản Word ở Bước 3.")
+                    
+                    if parsed.get("ve_viec"):
+                        st.session_state.bbh_meta["ve_viec"] = parsed["ve_viec"]
+                    if parsed.get("ket_luan_chung"):
+                        st.session_state.bbh_meta["ket_luan_chung"] = parsed["ket_luan_chung"]
+                    if parsed.get("rows") and isinstance(parsed["rows"], list):
+                        st.session_state.recap_rows = parsed["rows"]
+
+                    st.success("✅ Đã phân tích thành công! Kiểm tra bảng 7 cột bên dưới và chuyển sang Bước 3 để xuất file Word trình ký.")
                 except Exception as e:
                     st.error(f"Lỗi phân tích AI: {e}")
 
-    st.markdown("#### 🔍 Rà soát & Tinh chỉnh kết quả Recap (Liên thông trực tiếp sang Bước 3)")
-    st.session_state.recap_data["tom_tat_chung"] = st.text_area(
-        "1. Tóm tắt mục tiêu & bối cảnh (`{{tom_tat_chung}}`):",
-        value=st.session_state.recap_data.get("tom_tat_chung", ""), height=85
-    )
-    st.session_state.recap_data["noi_dung_thao_luan"] = st.text_area(
-        "2. Nội dung thảo luận chi tiết (`{{noi_dung_thao_luan}}`):",
-        value=st.session_state.recap_data.get("noi_dung_thao_luan", ""), height=160
-    )
-    st.session_state.recap_data["ket_luan_chi_dao"] = st.text_area(
-        "3. Kết luận & Chỉ đạo (`{{ket_luan_chi_dao}}`):",
-        value=st.session_state.recap_data.get("ket_luan_chi_dao", ""), height=110
-    )
-
-    st.markdown("**4. Bảng phân công công việc (`{{ke_hoach_hanh_dong}}` / `action_items`):**")
-    edited_actions = st.data_editor(
-        st.session_state.recap_data.get("action_items", []) or [{"tt": "1", "cong_viec": "", "phu_trach": "", "thoi_han": "", "ghi_chu": ""}],
+    st.markdown("#### 🔍 Rà soát & Chỉnh sửa Bảng III: Nội dung thảo luận và kế hoạch triển khai (Liên thông trực tiếp sang Bước 3)")
+    edited_rows = st.data_editor(
+        st.session_state.recap_rows,
+        column_config={
+            "tt": st.column_config.TextColumn("TT", width="small"),
+            "van_de": st.column_config.TextColumn("Vấn đề", width="medium"),
+            "noi_dung_thao_luan": st.column_config.TextColumn("Nội dung thảo luận", width="large"),
+            "cong_viec_tiep_theo": st.column_config.TextColumn("Công việc thực hiện tiếp theo", width="large"),
+            "trach_nhiem": st.column_config.TextColumn("T.nhiệm", width="small"),
+            "phoi_hop": st.column_config.TextColumn("P.hợp", width="small"),
+            "hoan_thanh": st.column_config.TextColumn("H.thành", width="small"),
+        },
         num_rows="dynamic",
-        use_container_width=True
+        use_container_width=True,
+        height=260,
+        key="recap_table_editor"
     )
-    st.session_state.recap_data["action_items"] = edited_actions
+    st.session_state.recap_rows = edited_rows
 
 # ----------------- TAB 3: XUẤT BIÊN BẢN HỌP WORD TRÌNH KÝ -----------------
 with tab3:
-    st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Trình Ký Ngay (Lấy trực tiếp từ kết quả Mục 2)")
+    st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Đúng Chuẩn Mẫu Phòng QLCL KCN - THACO AUTO")
     
-    col_dl_tpl, col_guide = st.columns([1, 2])
-    with col_dl_tpl:
-        st.download_button(
-            label="📥 Tải File Word Form Mẫu Chuẩn (.docx)",
-            data=generate_sample_docx(),
-            file_name="Mau_Bien_Ban_Hop_Chuan.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True
-        )
-    with col_guide:
-        st.caption(
-            "Các trường tự động đổ từ Mục 2 vào File Word mẫu của anh: "
-            "`{{ten_cuoc_hop}}`, `{{ngay_hop}}`, `{{dia_diem}}`, `{{chu_tri}}`, `{{thanh_phan}}`, `{{nguoi_lap}}`, "
-            "`{{tom_tat_chung}}`, `{{noi_dung_thao_luan}}`, `{{ket_luan_chi_dao}}`, `{{ke_hoach_hanh_dong}}` (và bảng lặp `action_items`)."
-        )
+    st.success(
+        "✨ **Cơ chế Nhận Diện Mẫu Thông Minh:** Anh chỉ cần tải trực tiếp file **`2026-1113. BB họp chất lượng xe xuất khẩuV4 - Copy.docx`** (hoặc bất kỳ BBH mẫu nào của Phòng QLCL KCN) lên ô bên dưới mà **không cần chỉnh sửa hay gõ thêm ký hiệu nào vào file Word**. Hệ thống sẽ tự động giữ nguyên Logo THACO AUTO, bảng Thành phần tham dự, bảng Chữ ký 4 cột và đổ toàn bộ dữ liệu từ Bước 2 vào đúng bảng 7 cột!"
+    )
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        ten_hop = st.text_input("Tên cuộc họp:", value="Họp đánh giá chất lượng & xử lý kỹ thuật")
-        ngay_hop = st.text_input("Thời gian họp:", value=datetime.now().strftime("%H:%M ngày %d/%m/%Y"))
-    with c2:
-        dia_diem = st.text_input("Địa điểm / Hình thức:", value="Trực tuyến qua Microsoft Teams")
-        chu_tri = st.text_input("Chủ trì cuộc họp:", value="")
-    with c3:
-        nguoi_lap = st.text_input("Người lập biên bản:", value="")
-        thanh_phan = st.text_input("Thành phần tham dự:", value="Các bộ phận liên quan")
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        st.session_state.bbh_meta["so_bbh"] = st.text_input("Số Biên bản họp:", value=st.session_state.bbh_meta["so_bbh"])
+        st.session_state.bbh_meta["ve_viec"] = st.text_input("V/v (Chủ đề cuộc họp):", value=st.session_state.bbh_meta["ve_viec"])
+    with col_m2:
+        st.session_state.bbh_meta["thoi_gian"] = st.text_input("I. Thời gian:", value=st.session_state.bbh_meta["thoi_gian"])
+        st.session_state.bbh_meta["dia_diem"] = st.text_input("I. Địa điểm:", value=st.session_state.bbh_meta["dia_diem"])
 
-    uploaded_docx = st.file_uploader("📂 Tải lên File Word Biên Bản Mẫu (.docx) của đơn vị:", type=["docx"])
+    st.session_state.bbh_meta["ket_luan_chung"] = st.text_area(
+        "Câu kết luận chỉ đạo cuối biên bản:",
+        value=st.session_state.bbh_meta["ket_luan_chung"],
+        height=70
+    )
 
-    # Hiển thị bản xem trước dữ liệu từ Bước 2 sẽ đưa vào Word
-    with st.expander("👁️ Xem trước dữ liệu Recap từ Bước 2 sẽ điền vào Biên bản Word", expanded=True):
-        st.markdown(f"- **Tóm tắt chung:** {st.session_state.recap_data.get('tom_tat_chung') or '*(Chưa có dữ liệu từ Bước 2)*'}")
-        st.markdown(f"- **Nội dung thảo luận:** {st.session_state.recap_data.get('noi_dung_thao_luan') or '*(Chưa có dữ liệu từ Bước 2)*'}")
-        st.markdown(f"- **Kết luận chỉ đạo:** {st.session_state.recap_data.get('ket_luan_chi_dao') or '*(Chưa có dữ liệu từ Bước 2)*'}")
+    uploaded_docx = st.file_uploader(
+        "📂 Tải lên File BBH Mẫu của anh (VD: `2026-1113. BB họp chất lượng xe xuất khẩuV4 - Copy.docx`):",
+        type=["docx"]
+    )
 
-    if st.button("🖨️ Kết Xuất Biên Bản Word Hoàn Chỉnh Để Trình Ký", type="primary", use_container_width=True):
+    if st.button("🖨️ Kết Xuất Biên Bản Họp Word (.docx) Để Trình Ký Ngay", type="primary", use_container_width=True):
         try:
-            template_stream = uploaded_docx if uploaded_docx else io.BytesIO(generate_sample_docx())
-            doc = DocxTemplate(template_stream)
+            if uploaded_docx is not None:
+                final_docx_bytes = populate_uploaded_thaco_docx(
+                    uploaded_docx.getvalue(),
+                    st.session_state.bbh_meta,
+                    st.session_state.recap_rows
+                )
+            else:
+                final_docx_bytes = generate_default_thaco_bbh_docx(
+                    st.session_state.bbh_meta,
+                    st.session_state.recap_rows
+                )
 
-            action_lines = []
-            for idx, item in enumerate(st.session_state.recap_data.get("action_items", []), 1):
-                if item.get("cong_viec"):
-                    action_lines.append(
-                        f"{idx}. {item.get('cong_viec', '')} | Phụ trách: {item.get('phu_trach', '')} "
-                        f"| Thời hạn: {item.get('thoi_han', '')} ({item.get('ghi_chu', '')})"
-                    )
-            action_str = "\n".join(action_lines) if action_lines else "Thực hiện theo kết luận chỉ đạo."
-
-            context = {
-                "ten_cuoc_hop": ten_hop,
-                "ngay_hop": ngay_hop,
-                "dia_diem": dia_diem,
-                "chu_tri": chu_tri,
-                "thanh_phan": thanh_phan,
-                "nguoi_lap": nguoi_lap,
-                "tom_tat_chung": st.session_state.recap_data.get("tom_tat_chung", ""),
-                "noi_dung_thao_luan": st.session_state.recap_data.get("noi_dung_thao_luan", ""),
-                "ket_luan_chi_dao": st.session_state.recap_data.get("ket_luan_chi_dao", ""),
-                "ke_hoach_hanh_dong": action_str,
-                "action_items": st.session_state.recap_data.get("action_items", [])
-            }
-
-            doc.render(context)
-            out_bio = io.BytesIO()
-            doc.save(out_bio)
-            out_bio.seek(0)
-
-            out_name = f"Bien_Ban_Hop_THACO_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
+            out_name = f"{datetime.now().strftime('%Y-%m%d')}. BB hop chat luong - QLCL KCN.docx"
             st.download_button(
-                label=f"⬇️ TẢI XUỐNG BIÊN BẢN TRÌNH KÝ ({out_name})",
-                data=out_bio.getvalue(),
+                label=f"⬇️ TẢI XUỐNG BIÊN BẢN HỌP HOÀN CHỈNH ({out_name})",
+                data=final_docx_bytes,
                 file_name=out_name,
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 type="primary",
                 use_container_width=True
             )
-            st.success("✅ Đã tạo biên bản thành công từ nội dung Recap Mục 2!")
+            st.success("✅ Đã xuất Biên bản họp chuẩn định dạng Phòng QLCL KCN - THACO AUTO! Anh bấm nút phía trên để tải về máy.")
         except Exception as e:
             st.error(f"Lỗi khi xuất file Word: {e}")
 
