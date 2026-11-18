@@ -627,7 +627,7 @@ with st.sidebar:
                 st.warning("Vui lòng nhập đủ Từ gốc, Từ dịch và Link Web App URL.")
 
 # ================= GIAO DIỆN CHÍNH =================
-st.title("🚗 Hệ Thống Trợ Lý Họp, Dịch Thuật Real-time & Xuất Biên Bản - Lưu Pro")
+st.title("Hệ Thống Trợ Lý Họp, Dịch Thuật Real-time & Xuất BBH - Lưu Pro")
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎙️ Bước 1: Thu Âm VB-Cable & Phụ Đề (Có Gắn Thẻ Nhân Sự)",
