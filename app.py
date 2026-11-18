@@ -3,6 +3,10 @@ import streamlit.components.v1 as components
 import requests
 import json
 import io
+import re
+import tempfile
+import os
+import time
 from datetime import datetime
 import google.generativeai as genai
 from docxtpl import DocxTemplate
@@ -19,58 +23,60 @@ defaults = {
     "glossary": {},             # Từ điển THACO dùng chung
     "tm": {},                   # Bộ nhớ dịch TM dùng chung
     "is_synced": False,         # Trạng thái đã tải dữ liệu lần đầu
+    "available_models": [],     # Danh sách model lấy từ API Key
     "recap_data": {
         "tom_tat_chung": "",
         "noi_dung_thao_luan": "",
         "ket_luan_chi_dao": "",
-        "action_items": []
+        "action_items": [
+            {"tt": "1", "cong_viec": "", "phu_trach": "", "thoi_han": "", "ghi_chu": ""}
+        ]
     }
 }
 for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ================= HÀM KẾT NỐI CHUẨN VỚI CODE.GS HIỆN TẠI CỦA ANH =================
-def sync_from_sheets(webapp_url):
-    """Đọc dữ liệu từ doGet(e) trả về { glossary: {}, tm: {} }"""
+# ================= HÀM LÀM SẠCH URL & KẾT NỐI GOOGLE SHEETS =================
+def clean_webapp_url(raw_url):
+    """Loại bỏ hoàn toàn dấu ngoặc vuông [], ngoặc kép, khoảng trắng bị dính khi copy/paste"""
+    if not raw_url:
+        return ""
+    s = str(raw_url).strip()
+    match = re.search(r'https?://[^\s\[\]"\'<>()]+', s)
+    if match:
+        return match.group(0)
+    return s.strip("[]\"'() ")
+
+def sync_from_sheets(raw_url):
+    webapp_url = clean_webapp_url(raw_url)
     if not webapp_url:
-        return False, "⚠️ Chưa nhập Link Web App URL."
+        return False, "⚠️ Chưa nhập Link Web App URL hợp lệ."
     try:
-        res = requests.get(webapp_url.strip(), timeout=12)
+        res = requests.get(webapp_url, timeout=12)
         if res.status_code == 200:
             data = res.json()
             st.session_state.glossary = data.get("glossary", {})
             st.session_state.tm = data.get("tm", {})
             st.session_state.is_synced = True
-            return True, f"✅ Đã đồng bộ chung: {len(st.session_state.glossary)} thuật ngữ & {len(st.session_state.tm)} câu TM."
+            return True, f"✅ Đã đồng bộ: {len(st.session_state.glossary)} thuật ngữ & {len(st.session_state.tm)} câu TM."
     except Exception as e:
         return False, f"❌ Lỗi kết nối Google Sheets: {e}"
-    return False, "❌ Đường dẫn Web App URL không phản hồi."
+    return False, f"❌ Đường dẫn không phản hồi (HTTP {res.status_code})."
 
-def save_full_glossary_to_sheets(webapp_url, updated_glossary_dict):
-    """
-    Khớp với action === 'save_glossary' trong Code.gs:
-    Vì Code.gs dùng gSheet.clearContents(), hàm này luôn kéo dữ liệu mới nhất trên mây về,
-    gộp với dữ liệu mới rồi mới đẩy toàn bộ lên để bảo vệ dữ liệu của phần mềm dịch tài liệu.
-    """
+def save_full_glossary_to_sheets(raw_url, updated_glossary_dict):
+    webapp_url = clean_webapp_url(raw_url)
     if not webapp_url:
         return False, "Chưa nhập Link Web App URL."
     try:
-        # Bước 1: Lấy dữ liệu mới nhất từ Sheets để tránh ghi đè mất từ của người khác
-        res_get = requests.get(webapp_url.strip(), timeout=10)
+        res_get = requests.get(webapp_url, timeout=10)
         cloud_glossary = {}
         if res_get.status_code == 200:
             cloud_glossary = res_get.json().get("glossary", {})
         
-        # Bước 2: Gộp từ điển trên mây và từ điển cập nhật
         cloud_glossary.update(updated_glossary_dict)
-        
-        # Bước 3: Đẩy toàn bộ lên theo đúng cấu trúc payload.action = "save_glossary"
-        payload = {
-            "action": "save_glossary",
-            "data": cloud_glossary
-        }
-        res_post = requests.post(webapp_url.strip(), data=json.dumps(payload), timeout=12)
+        payload = {"action": "save_glossary", "data": cloud_glossary}
+        res_post = requests.post(webapp_url, data=json.dumps(payload), timeout=12)
         if res_post.status_code == 200 and res_post.json().get("status") == "ok":
             st.session_state.glossary = cloud_glossary
             return True, f"✅ Đã lưu đồng bộ {len(cloud_glossary)} thuật ngữ lên Google Sheets!"
@@ -78,20 +84,14 @@ def save_full_glossary_to_sheets(webapp_url, updated_glossary_dict):
     except Exception as e:
         return False, f"❌ Lỗi kết nối: {e}"
 
-def upsert_tm_to_sheets(webapp_url, new_tm_dict):
-    """
-    Khớp với action === 'upsert_tm' trong Code.gs:
-    Hỗ trợ đẩy 1 câu hoặc hàng loạt câu cùng lúc. Nếu câu đã có sẽ tự động ghi đè bản dịch chuẩn mới.
-    """
+def upsert_tm_to_sheets(raw_url, new_tm_dict):
+    webapp_url = clean_webapp_url(raw_url)
     if not webapp_url or not new_tm_dict:
         return False, "Không có dữ liệu hoặc thiếu URL."
     try:
         clean_dict = {str(k).strip(): str(v).strip() for k, v in new_tm_dict.items() if str(k).strip() and str(v).strip()}
-        payload = {
-            "action": "upsert_tm",
-            "data": clean_dict
-        }
-        res = requests.post(webapp_url.strip(), data=json.dumps(payload), timeout=12)
+        payload = {"action": "upsert_tm", "data": clean_dict}
+        res = requests.post(webapp_url, data=json.dumps(payload), timeout=12)
         if res.status_code == 200 and res.json().get("status") == "ok":
             st.session_state.tm.update(clean_dict)
             return True, f"✅ Đã cập nhật {len(clean_dict)} câu vào Bộ nhớ đệm (TM) dùng chung!"
@@ -99,9 +99,41 @@ def upsert_tm_to_sheets(webapp_url, new_tm_dict):
     except Exception as e:
         return False, f"❌ Lỗi kết nối: {e}"
 
+# ================= HÀM QUÉT MODEL KHẢ DỤNG & CHỌN MODEL TỐI ƯU =================
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_available_models(api_key):
+    """Lấy danh sách các model thực tế khả dụng với API Key của người dùng"""
+    if not api_key:
+        return []
+    try:
+        genai.configure(api_key=api_key.strip())
+        models = []
+        for m in genai.list_models():
+            if "generateContent" in m.supported_generation_methods:
+                name = m.name.replace("models/", "")
+                models.append(name)
+        return models
+    except Exception:
+        return []
+
+def pick_optimal_model(models_list, task="recap"):
+    """Tự động đề xuất model tối ưu: 'pro' cho Recap/Audio, 'flash' cho Dịch nhanh"""
+    if not models_list:
+        return "gemini-1.5-pro" if task == "recap" else "gemini-1.5-flash"
+    
+    if task == "recap":
+        priorities = ["gemini-2.5-pro", "gemini-1.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    else:
+        priorities = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        
+    for p in priorities:
+        for m in models_list:
+            if m == p or m.startswith(p):
+                return m
+    return models_list[0]
+
 # ================= HÀM DỊCH THUẬT AI + SO KHỚP GLOSSARY & TM =================
-def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, webapp_url=""):
-    """Dịch thông minh kết hợp TM (0ms), Glossary và tự động gom nhóm đẩy lên Sheets 1 lần"""
+def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, model_name, raw_url=""):
     results = []
     tm_to_upsert = {}
 
@@ -112,7 +144,6 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, webapp_url
             results.append({"time": time_tag, "source": clean_text, "target": clean_text, "terms": []})
             continue
 
-        # 1. Tra cứu trực tiếp trong Bộ nhớ đệm (TM) dùng chung
         if clean_text in st.session_state.tm:
             results.append({
                 "time": time_tag,
@@ -122,7 +153,6 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, webapp_url
             })
             continue
 
-        # 2. Quét các thuật ngữ trong Glossary xuất hiện trong câu nói
         matched = {}
         for vn_term, en_term in st.session_state.glossary.items():
             if vn_term.lower() in clean_text.lower() or en_term.lower() in clean_text.lower():
@@ -143,8 +173,8 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, webapp_url
             glossary_instruction = f"BẮT BUỘC sử dụng đúng thuật ngữ chuyên ngành THACO sau: {json.dumps(matched, ensure_ascii=False)}. "
 
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            genai.configure(api_key=api_key.strip())
+            model = genai.GenerativeModel(model_name)
             prompt = (
                 f"Bạn là chuyên gia phiên dịch kỹ thuật và quản lý chất lượng của THACO AUTO. "
                 f"Hãy dịch câu hội thoại sau từ {direction} thật chuẩn xác, ngắn gọn, đúng văn phong kỹ thuật ô tô. "
@@ -161,16 +191,14 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, api_key, webapp_url
                 "terms": list(matched.keys())
             })
 
-            # Đưa vào danh sách chờ đẩy lên TM dùng chung (chỉ lưu câu có ý nghĩa từ 3 từ trở lên)
             if len(clean_text.split()) >= 3:
                 tm_to_upsert[clean_text] = translated
 
         except Exception as e:
             results.append({"time": time_tag, "source": clean_text, "target": f"[Lỗi AI: {e}]", "terms": []})
 
-    # 3. Đẩy toàn bộ câu mới dịch lên Google Sheets TM trong 1 lượt gọi duy nhất (Batch Upsert)
-    if webapp_url and tm_to_upsert:
-        upsert_tm_to_sheets(webapp_url, tm_to_upsert)
+    if raw_url and tm_to_upsert:
+        upsert_tm_to_sheets(raw_url, tm_to_upsert)
 
     return results
 
@@ -185,7 +213,7 @@ def generate_sample_docx():
     p_info.add_run("{{ten_cuoc_hop}}\n")
     p_info.add_run("2. Thời gian: ").bold = True
     p_info.add_run("{{ngay_hop}}\n")
-    p_info.add_run("3. Địa điểm / Nền tảng: ").bold = True
+    p_info.add_run("3. Địa điểm / Hình thức: ").bold = True
     p_info.add_run("{{dia_diem}}\n")
     p_info.add_run("4. Chủ trì: ").bold = True
     p_info.add_run("{{chu_tri}}\n")
@@ -219,14 +247,44 @@ def generate_sample_docx():
 with st.sidebar:
     st.header("⚙️ Cấu Hình Hệ Thống")
     
-    # Tự động đọc từ Streamlit Secrets nếu có cài đặt sẵn
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     default_url = st.secrets.get("WEBAPP_URL", "") if "WEBAPP_URL" in st.secrets else ""
 
     gemini_api_key = st.text_input("🔑 1. Gemini API Key:", value=default_key, type="password")
-    webapp_url = st.text_input("☁️ 2. Link Google Apps Script (Dùng chung):", value=default_url)
     
-    # Tự động tải Glossary & TM ngay lần đầu mở ứng dụng nếu đã có URL
+    # Quét danh sách Model khả dụng ngay khi có API Key
+    if gemini_api_key:
+        models_list = fetch_available_models(gemini_api_key)
+        if models_list:
+            st.success(f"✅ API Key hợp lệ ({len(models_list)} model khả dụng)")
+            opt_recap = pick_optimal_model(models_list, task="recap")
+            opt_trans = pick_optimal_model(models_list, task="translate")
+            
+            selected_recap_model = st.selectbox(
+                "🧠 Model AI cho Recap & Nghe File Âm Thanh (Tối ưu):",
+                options=models_list,
+                index=models_list.index(opt_recap) if opt_recap in models_list else 0,
+                help="Hệ thống đã tự động chọn model mạnh nhất (Pro/Flash) cho phân tích sâu và nghe file ghi âm."
+            )
+            selected_trans_model = st.selectbox(
+                "⚡ Model AI cho Dịch Phụ Đề Nhanh:",
+                options=models_list,
+                index=models_list.index(opt_trans) if opt_trans in models_list else 0,
+                help="Hệ thống tự động chọn dòng Flash để dịch nhanh theo thời gian thực."
+            )
+        else:
+            st.error("❌ Không lấy được danh sách Model. Vui lòng kiểm tra lại API Key.")
+            selected_recap_model = "gemini-1.5-pro"
+            selected_trans_model = "gemini-1.5-flash"
+    else:
+        st.caption("Nhập API Key để hệ thống hiển thị các Model khả dụng.")
+        selected_recap_model = "gemini-1.5-pro"
+        selected_trans_model = "gemini-1.5-flash"
+
+    st.divider()
+    raw_webapp_Input = st.text_input("☁️ 2. Link Google Apps Script (Dùng chung):", value=default_url)
+    webapp_url = clean_webapp_url(raw_webapp_Input)
+    
     if webapp_url and not st.session_state.is_synced:
         ok, msg = sync_from_sheets(webapp_url)
         if ok:
@@ -234,9 +292,12 @@ with st.sidebar:
 
     if st.button("🔄 Đồng bộ lại Glossary & TM từ Sheets", use_container_width=True, type="primary"):
         ok, msg = sync_from_sheets(webapp_url)
-        st.success(msg) if ok else st.error(msg)
+        if ok:
+            st.success(msg)
+        else:
+            st.error(msg)
 
-    st.caption(f"📊 Trạng thái Kho dữ liệu chung: **{len(st.session_state.glossary)}** thuật ngữ | **{len(st.session_state.tm)}** câu TM")
+    st.caption(f"📊 Kho dữ liệu chung: **{len(st.session_state.glossary)}** thuật ngữ | **{len(st.session_state.tm)}** câu TM")
 
     st.divider()
     st.subheader("🌐 Chế độ Ngôn ngữ Họp")
@@ -252,7 +313,10 @@ with st.sidebar:
         if st.button("💾 Lưu an toàn vào Glossary", use_container_width=True):
             if new_vn and new_en and webapp_url:
                 ok, msg = save_full_glossary_to_sheets(webapp_url, {new_vn.strip(): new_en.strip()})
-                st.success(msg) if ok else st.error(msg)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
             else:
                 st.warning("Vui lòng nhập đủ Từ gốc, Từ dịch và Link Web App URL.")
 
@@ -260,10 +324,10 @@ with st.sidebar:
 st.title("🚗 Hệ Thống Trợ Lý Họp, Dịch Thuật Real-time & Xuất Biên Bản THACO")
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "🎙️ 1. Thu Âm VB-Cable & Phụ Đề Real-time",
-    "🧠 2. AI Recap Cuộc Họp (Đa Kịch Bản)",
-    "📄 3. Xuất Biên Bản Word Trình Ký",
-    "📚 4. Quản Trị & Hiệu Đính Kho TM / Glossary Chung"
+    "🎙️ Bước 1: Thu Âm VB-Cable & Phụ Đề",
+    "🧠 Bước 2: AI Recap (Từ File Ghi Âm / .TXT)",
+    "📄 Bước 3: Xuất Biên Bản Word Trình Ký",
+    "📚 Quản Trị Kho TM / Glossary Chung"
 ])
 
 # ----------------- TAB 1: THU ÂM VB-CABLE TRÊN WEB & PHỤ ĐỀ -----------------
@@ -271,7 +335,7 @@ with tab1:
     st.info(
         "🔊 **Thiết lập chuẩn với VB-Audio Virtual Cable:** "
         "Trong cài đặt âm thanh của **MS Teams / Zoom / VooV**, chọn Loa (Speaker) là `CABLE Input`. "
-        "Ở ô chọn thiết bị bên dưới, hệ thống sẽ tự động nhận diện và chọn **`⭐ CABLE Output (VB-Audio Virtual Cable)`**."
+        "Khi kết thúc thu âm, anh có thể tải trực tiếp **File Ghi Âm Gốc (`.webm`)** hoặc **File Phụ Đề (`.txt`)** để đưa thẳng sang Bước 2 làm đầu vào Recap."
     )
 
     speech_lang = "en-US" if trans_mode == "Anh -> Việt" else "vi-VN"
@@ -281,10 +345,11 @@ with tab1:
     web_audio_component = f"""
     <div style="background:#f8fafc; border:1px solid #cbd5e1; border-radius:10px; padding:16px; font-family:sans-serif;">
       <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:12px;">
-        <select id="audioSource" style="flex:1; min-width:260px; padding:8px; border-radius:6px; border:1px solid #94a3b8; font-weight:600;"></select>
+        <select id="audioSource" style="flex:1; min-width:240px; padding:8px; border-radius:6px; border:1px solid #94a3b8; font-weight:600;"></select>
         <button id="btnStart" onclick="startCapture()" style="background:#16a34a; color:white; border:none; padding:9px 16px; border-radius:6px; font-weight:bold; cursor:pointer;">▶️ Bắt đầu Lắng nghe & Ghi âm</button>
         <button id="btnStop" onclick="stopCapture()" disabled style="background:#dc2626; color:white; border:none; padding:9px 16px; border-radius:6px; font-weight:bold; cursor:pointer; opacity:0.5;">⏹️ Dừng</button>
-        <a id="downloadAudio" style="display:none; background:#2563eb; color:white; text-decoration:none; padding:9px 14px; border-radius:6px; font-weight:bold; font-size:13px;">💾 Tải File Ghi Âm Gốc</a>
+        <a id="downloadAudio" style="display:none; background:#2563eb; color:white; text-decoration:none; padding:9px 14px; border-radius:6px; font-weight:bold; font-size:13px;">💾 1. Tải File Ghi Âm (.webm)</a>
+        <a id="downloadTxt" style="display:none; background:#0d9488; color:white; text-decoration:none; padding:9px 14px; border-radius:6px; font-weight:bold; font-size:13px;">📄 2. Tải File Phụ Đề (.txt)</a>
       </div>
 
       <div style="display:flex; align-items:center; gap:12px; margin-bottom:10px; font-size:13px; color:#334155;">
@@ -301,7 +366,7 @@ with tab1:
       </div>
 
       <div style="margin-top:10px; display:flex; justify-content:space-between; align-items:center;">
-        <span style="font-size:12px; color:#475569;">✨ Câu nào trùng khớp trong <b>TM dùng chung</b> sẽ hiển thị bản dịch ngay lập tức. Bấm Copy để chuyển xuống bàn dịch AI & hiệu đính:</span>
+        <span style="font-size:12px; color:#475569;">✨ Sau khi bấm <b>Dừng</b>, anh có thể tải File Ghi Âm hoặc File .TXT ở thanh trên để đưa sang Bước 2 Recap, hoặc Copy nhanh bên dưới:</span>
         <button onclick="copyTranscript()" style="background:#0284c7; color:white; border:none; padding:7px 14px; border-radius:6px; font-weight:bold; cursor:pointer;">📋 Copy toàn bộ nội dung họp</button>
       </div>
       <textarea id="fullBuffer" style="width:100%; height:85px; margin-top:6px; border-radius:6px; border:1px solid #cbd5e1; padding:8px; font-size:13px;" placeholder="Nội dung phụ đề kèm mốc thời gian sẽ tự động ghi vào đây..."></textarea>
@@ -342,11 +407,9 @@ with tab1:
 
       function enrichWithSharedMemory(text) {{
         let html = text;
-        // 1. Nếu câu khớp hoàn toàn trong TM dùng chung -> Hiển thị bản dịch chuẩn tức thời
         if (tm[text]) {{
           html += `<br><span style="color:#4ade80; font-weight:bold;">⚡ [TM Chuẩn]: ${{tm[text]}}</span>`;
         }}
-        // 2. Tô sáng các thuật ngữ trong Glossary dùng chung
         for (const [vn, en] of Object.entries(glossary)) {{
           if (vn && text.toLowerCase().includes(vn.toLowerCase())) {{
             html += ` <span style="background:#ca8a04; color:#fff; padding:1px 6px; border-radius:4px; font-size:12px;">[${{vn}} ➔ ${{en}}]</span>`;
@@ -355,6 +418,17 @@ with tab1:
           }}
         }}
         return html;
+      }}
+
+      function updateTxtDownloadLink() {{
+        const textVal = document.getElementById('fullBuffer').value;
+        if (!textVal.trim()) return;
+        const blobTxt = new Blob([textVal], {{ type: 'text/plain;charset=utf-8' }});
+        const urlTxt = URL.createObjectURL(blobTxt);
+        const aTxt = document.getElementById('downloadTxt');
+        aTxt.href = urlTxt;
+        aTxt.download = 'Phu_De_Hop_THACO_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.txt';
+        aTxt.style.display = 'inline-block';
       }}
 
       async function startCapture() {{
@@ -394,6 +468,7 @@ with tab1:
             a.href = url;
             a.download = 'Ghi_Am_Hop_THACO_' + new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.webm';
             a.style.display = 'inline-block';
+            updateTxtDownloadLink();
           }};
           mediaRecorder.start();
 
@@ -418,6 +493,7 @@ with tab1:
                 const buf = document.getElementById('fullBuffer');
                 buf.value += `[${{now}}] ${{transcript}}\\n`;
                 buf.scrollTop = buf.scrollHeight;
+                updateTxtDownloadLink();
               }} else {{
                 interim += transcript;
               }}
@@ -447,11 +523,12 @@ with tab1:
         if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
         if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
         if (audioContext) audioContext.close();
+        updateTxtDownloadLink();
         document.getElementById('btnStart').disabled = false;
         document.getElementById('btnStart').style.opacity = '1';
         document.getElementById('btnStop').disabled = true;
         document.getElementById('btnStop').style.opacity = '0.5';
-        document.getElementById('statusText').innerText = '⏹️ Đã dừng thu âm.';
+        document.getElementById('statusText').innerText = '⏹️ Đã dừng. Hãy bấm tải File Ghi Âm hoặc File .TXT!';
         document.getElementById('statusText').style.color = '#dc2626';
       }}
 
@@ -459,7 +536,7 @@ with tab1:
         const buf = document.getElementById('fullBuffer');
         buf.select();
         document.execCommand('copy');
-        alert('Đã copy toàn bộ nội dung! Hãy dán vào ô bên dưới để Dịch chuẩn hóa & Tự động cập nhật vào TM dùng chung.');
+        alert('Đã copy toàn bộ nội dung!');
       }}
     </script>
     """
@@ -471,10 +548,10 @@ with tab1:
         raw_input_box = st.text_area(
             "📥 Dán nội dung cuộc họp vừa Copy (hoặc nhập câu cần dịch):",
             value=st.session_state.raw_stream_input,
-            height=230,
+            height=220,
             placeholder="[09:15:20] We need to check the warranty policy for CBU units..."
         )
-        if st.button("🚀 Dịch Chuẩn Hóa & Đẩy Lên TM Dùng Chung", type="primary", use_container_width=True):
+        if st.button(f"🚀 Dịch Chuẩn Hóa ({selected_trans_model}) & Đẩy Lên TM", type="primary", use_container_width=True):
             st.session_state.raw_stream_input = raw_input_box
             raw_lines = [line.strip() for line in raw_input_box.split("\n") if line.strip()]
             parsed_lines = []
@@ -487,9 +564,9 @@ with tab1:
                     c_part = line[idx+1:].strip()
                 parsed_lines.append((t_tag, c_part))
 
-            with st.spinner("Đang đối chiếu TM/Glossary dùng chung và dịch bằng Gemini Flash..."):
+            with st.spinner(f"Đang đối chiếu TM/Glossary và dịch bằng {selected_trans_model}..."):
                 st.session_state.transcript_list = translate_batch_with_thaco_memory(
-                    parsed_lines, trans_mode, gemini_api_key, webapp_url
+                    parsed_lines, trans_mode, gemini_api_key, selected_trans_model, webapp_url
                 )
                 st.success("Đã dịch và đồng bộ tự động các câu mới lên Sheet TM!")
 
@@ -513,22 +590,63 @@ with tab1:
             if st.button("💾 Lưu các câu vừa hiệu đính đè lên Google Sheets (`upsert_tm`)", use_container_width=True):
                 upsert_dict = {item["source"]: item["target"] for item in edited_subtitles if item.get("source") and item.get("target")}
                 ok, msg = upsert_tm_to_sheets(webapp_url, upsert_dict)
-                st.success(msg) if ok else st.error(msg)
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
         else:
             st.info("Chưa có dữ liệu dịch. Hãy bấm nút Dịch bên trái để hiển thị bảng hiệu đính.")
 
-# ----------------- TAB 2: AI RECAP CUỘC HỌP (ĐA KỊCH BẢN) -----------------
+# ----------------- TAB 2: AI RECAP TỪ FILE GHI ÂM HOẶC FILE .TXT -----------------
 with tab2:
-    st.subheader("🧠 Tổng Hợp & Phân Tích Cuộc Họp Bằng Gemini Pro")
+    st.subheader(f"🧠 Tổng Hợp & Phân Tích Cuộc Họp (Model đang chọn: `{selected_recap_model}`)")
+
+    input_source_mode = st.radio(
+        "📂 Chọn nguồn đầu vào cho AI Recap:",
+        [
+            "🎙️ 1. Dùng File Ghi Âm (.webm / .wav / .mp3 / .m4a) tải về từ Bước 1 (AI nghe trực tiếp cuộc họp - Chuẩn xác nhất)",
+            "📄 2. Dùng File Phụ Đề (.txt) tải về từ Bước 1",
+            "📝 3. Dùng trực tiếp văn bản đã dịch / dán ở Bước 1"
+        ]
+    )
+
+    uploaded_audio_recap = None
+    uploaded_txt_recap = None
+    text_for_recap = ""
+
+    if input_source_mode.startswith("🎙️"):
+        uploaded_audio_recap = st.file_uploader(
+            "Tải lên File Ghi Âm cuộc họp vừa thu ở Bước 1 (.webm, .wav, .mp3, .m4a):",
+            type=["webm", "wav", "mp3", "m4a", "ogg"]
+        )
+        if uploaded_audio_recap:
+            st.audio(uploaded_audio_recap)
+    elif input_source_mode.startswith("📄"):
+        uploaded_txt_recap = st.file_uploader(
+            "Tải lên File Phụ Đề (.txt) vừa tải xuống từ Bước 1:",
+            type=["txt"]
+        )
+        if uploaded_txt_recap:
+            text_for_recap = uploaded_txt_recap.read().decode("utf-8", errors="ignore")
+            st.text_area("Nội dung trong file .txt:", value=text_for_recap, height=130)
+    else:
+        combined_transcript = "\n".join(
+            [f"[{x['time']}] {x['target']} (Gốc: {x['source']})" for x in st.session_state.transcript_list]
+        ) or st.session_state.raw_stream_input
+        text_for_recap = st.text_area(
+            "Nội dung văn bản cuộc họp:",
+            value=combined_transcript,
+            height=140
+        )
 
     prompt_templates = {
-        "1. Họp Xử lý lỗi Kỹ thuật & Chất lượng sau bán hàng (Khuyên dùng)": """Đóng vai Trưởng bộ phận Quản lý Chất lượng tại THACO AUTO. Dựa vào nội dung cuộc họp và bảng thuật ngữ THACO, hãy phân tích và xuất ra định dạng JSON chuẩn với các trường sau:
+        "1. Họp Xử lý lỗi Kỹ thuật & Chất lượng sau bán hàng (Khuyên dùng)": """Đóng vai Trưởng bộ phận Quản lý Chất lượng tại THACO AUTO. Dựa vào toàn bộ nội dung cuộc họp và bảng thuật ngữ THACO, hãy phân tích kỹ lưỡng và xuất ra định dạng JSON chuẩn với đúng các trường sau:
 {
   "tom_tat_chung": "Tóm tắt mục tiêu cuộc họp, dòng xe/linh kiện liên quan và bối cảnh vấn đề (3-5 câu)",
-  "noi_dung_thao_luan": "Phân tích rõ: (1) Hiện tượng & Dữ liệu thực tế, (2) Phân tích nguyên nhân gốc rễ (Root Cause), (3) Đối sách xử lý tạm thời và lâu dài",
-  "ket_luan_chi_dao": "Các quyết định chốt của người chủ trì cuộc họp",
+  "noi_dung_thao_luan": "Phân tích chi tiết: (1) Hiện tượng & Số liệu thực tế, (2) Phân tích nguyên nhân gốc rễ (Root Cause), (3) Đối sách xử lý tạm thời và lâu dài",
+  "ket_luan_chi_dao": "Các quyết định và chỉ đạo chốt của người chủ trì cuộc họp",
   "action_items": [
-    {"cong_viec": "Tên đầu việc cụ thể", "phu_trach": "Đơn vị / Cá nhân", "thoi_han": "Thời hạn hoàn thành", "ghi_chu": "Yêu cầu báo cáo"}
+    {"tt": "1", "cong_viec": "Tên đầu việc cụ thể", "phu_trach": "Đơn vị / Cá nhân", "thoi_han": "Thời hạn hoàn thành", "ghi_chu": "Yêu cầu báo cáo"}
   ]
 }
 Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.""",
@@ -539,7 +657,7 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
   "noi_dung_thao_luan": "Chi tiết các cam kết kỹ thuật, chính sách bảo hành, tiến độ cung ứng hoặc chuyển giao công nghệ",
   "ket_luan_chi_dao": "Các thỏa thuận đã thống nhất giữa hai bên và các điểm còn chờ xác nhận",
   "action_items": [
-    {"cong_viec": "Hạng mục cần thực hiện", "phu_trach": "THACO / Đối tác", "thoi_han": "Deadline", "ghi_chu": "Ghi chú"}
+    {"tt": "1", "cong_viec": "Hạng mục cần thực hiện", "phu_trach": "THACO / Đối tác", "thoi_han": "Deadline", "ghi_chu": "Ghi chú"}
   ]
 }
 Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.""",
@@ -550,41 +668,61 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
   "noi_dung_thao_luan": "Báo cáo của từng bộ phận, các vướng mắc phát sinh và giải pháp tháo gỡ",
   "ket_luan_chi_dao": "Ý kiến chỉ đạo chốt của Lãnh đạo chủ trì",
   "action_items": [
-    {"cong_viec": "Nhiệm vụ trọng tâm", "phu_trach": "Phòng/Ban phụ trách", "thoi_han": "Thời hạn", "ghi_chu": "Ghi chú"}
+    {"tt": "1", "cong_viec": "Nhiệm vụ trọng tâm", "phu_trach": "Phòng/Ban phụ trách", "thoi_han": "Thời hạn", "ghi_chu": "Ghi chú"}
   ]
 }
 Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown."""
     }
 
-    selected_tpl = st.selectbox("📂 Chọn kịch bản Prompt mẫu (hoặc tùy chỉnh trực tiếp bên dưới):", list(prompt_templates.keys()))
-    custom_prompt = st.text_area("✍️ Nội dung Prompt giao cho Gemini Pro:", value=prompt_templates[selected_tpl], height=170)
+    selected_tpl = st.selectbox("📌 Chọn kịch bản Prompt Recap (hoặc chỉnh sửa trực tiếp bên dưới):", list(prompt_templates.keys()))
+    custom_prompt = st.text_area("✍️ Nội dung Prompt giao cho AI:", value=prompt_templates[selected_tpl], height=160)
 
-    combined_transcript = "\n".join(
-        [f"[{x['time']}] {x['target']} (Gốc: {x['source']})" for x in st.session_state.transcript_list]
-    ) or st.session_state.raw_stream_input
-
-    meeting_text_for_recap = st.text_area(
-        "📝 Toàn bộ nội dung cuộc họp đưa vào phân tích:",
-        value=combined_transcript,
-        height=150
-    )
-
-    if st.button("✨ Chạy AI Gemini Pro Tổng Hợp Biên Bản", type="primary", use_container_width=True):
+    if st.button(f"✨ Chạy AI Recap Với Model `{selected_recap_model}`", type="primary", use_container_width=True):
         if not gemini_api_key:
             st.error("Vui lòng nhập Gemini API Key ở thanh bên trái!")
-        elif not meeting_text_for_recap.strip():
-            st.warning("Chưa có dữ liệu cuộc họp để phân tích!")
+        elif input_source_mode.startswith("🎙️") and not uploaded_audio_recap:
+            st.warning("Vui lòng tải lên File Ghi Âm từ Bước 1!")
+        elif not input_source_mode.startswith("🎙️") and not text_for_recap.strip():
+            st.warning("Chưa có dữ liệu văn bản cuộc họp để phân tích!")
         else:
-            with st.spinner("Gemini Pro đang phân tích chuyên sâu cùng Bảng thuật ngữ THACO..."):
+            with st.spinner(f"Model {selected_recap_model} đang xử lý dữ liệu cuộc họp và đối chiếu Bảng thuật ngữ THACO..."):
                 try:
-                    genai.configure(api_key=gemini_api_key)
-                    model = genai.GenerativeModel("gemini-1.5-pro")
-                    full_prompt = (
-                        f"{custom_prompt}\n\n"
-                        f"--- BẢNG THUẬT NGỮ THACO DÙNG CHUNG ---\n{json.dumps(st.session_state.glossary, ensure_ascii=False)}\n\n"
-                        f"--- NỘI DUNG CUỘC HỌP ---\n{meeting_text_for_recap}"
-                    )
-                    res = model.generate_content(full_prompt)
+                    genai.configure(api_key=gemini_api_key.strip())
+                    model = genai.GenerativeModel(selected_recap_model)
+                    glossary_context = f"--- BẢNG THUẬT NGỮ THACO DÙNG CHUNG ---\n{json.dumps(st.session_state.glossary, ensure_ascii=False)}\n\n"
+
+                    if input_source_mode.startswith("🎙️"):
+                        # Xử lý File Ghi Âm trực tiếp qua Gemini File API
+                        suffix = "." + uploaded_audio_recap.name.split(".")[-1]
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                            tmp_file.write(uploaded_audio_recap.getvalue())
+                            tmp_path = tmp_file.name
+                        
+                        gemini_audio_file = genai.upload_file(path=tmp_path)
+                        # Chờ file audio sẵn sàng
+                        while gemini_audio_file.state.name == "PROCESSING":
+                            time.sleep(1)
+                            gemini_audio_file = genai.get_file(gemini_audio_file.name)
+
+                        full_prompt = (
+                            f"{custom_prompt}\n\n"
+                            f"{glossary_context}"
+                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm (có thể gồm tiếng Việt và tiếng Anh) và tổng hợp chính xác theo cấu trúc JSON đã yêu cầu."
+                        )
+                        res = model.generate_content([gemini_audio_file, full_prompt])
+                        try:
+                            genai.delete_file(gemini_audio_file.name)
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                    else:
+                        full_prompt = (
+                            f"{custom_prompt}\n\n"
+                            f"{glossary_context}"
+                            f"--- NỘI DUNG CUỘC HỌP ---\n{text_for_recap}"
+                        )
+                        res = model.generate_content(full_prompt)
+
                     cleaned = res.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                     parsed = json.loads(cleaned)
                     st.session_state.recap_data = {
@@ -593,14 +731,14 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
                         "ket_luan_chi_dao": parsed.get("ket_luan_chi_dao", ""),
                         "action_items": parsed.get("action_items", [])
                     }
-                    st.success("✅ Đã phân tích xong! Anh có thể rà soát và tinh chỉnh ngay bên dưới trước khi xuất Word.")
+                    st.success("✅ Đã Recap thành công! Toàn bộ nội dung dưới đây đã sẵn sàng để xuất sang Biên bản Word ở Bước 3.")
                 except Exception as e:
                     st.error(f"Lỗi phân tích AI: {e}")
 
-    st.markdown("#### 🔍 Rà soát & Tinh chỉnh nội dung Biên bản")
+    st.markdown("#### 🔍 Rà soát & Tinh chỉnh kết quả Recap (Liên thông trực tiếp sang Bước 3)")
     st.session_state.recap_data["tom_tat_chung"] = st.text_area(
         "1. Tóm tắt mục tiêu & bối cảnh (`{{tom_tat_chung}}`):",
-        value=st.session_state.recap_data.get("tom_tat_chung", ""), height=90
+        value=st.session_state.recap_data.get("tom_tat_chung", ""), height=85
     )
     st.session_state.recap_data["noi_dung_thao_luan"] = st.text_area(
         "2. Nội dung thảo luận chi tiết (`{{noi_dung_thao_luan}}`):",
@@ -611,9 +749,9 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
         value=st.session_state.recap_data.get("ket_luan_chi_dao", ""), height=110
     )
 
-    st.markdown("**4. Bảng phân công công việc (`{{ke_hoach_hanh_dong}}`):**")
+    st.markdown("**4. Bảng phân công công việc (`{{ke_hoach_hanh_dong}}` / `action_items`):**")
     edited_actions = st.data_editor(
-        st.session_state.recap_data.get("action_items", []) or [{"cong_viec": "", "phu_trach": "", "thoi_han": "", "ghi_chu": ""}],
+        st.session_state.recap_data.get("action_items", []) or [{"tt": "1", "cong_viec": "", "phu_trach": "", "thoi_han": "", "ghi_chu": ""}],
         num_rows="dynamic",
         use_container_width=True
     )
@@ -621,7 +759,7 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
 
 # ----------------- TAB 3: XUẤT BIÊN BẢN HỌP WORD TRÌNH KÝ -----------------
 with tab3:
-    st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Trình Ký Ngay")
+    st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Trình Ký Ngay (Lấy trực tiếp từ kết quả Mục 2)")
     
     col_dl_tpl, col_guide = st.columns([1, 2])
     with col_dl_tpl:
@@ -634,9 +772,9 @@ with tab3:
         )
     with col_guide:
         st.caption(
-            "Các biến tự động điền trong file Word mẫu: "
+            "Các trường tự động đổ từ Mục 2 vào File Word mẫu của anh: "
             "`{{ten_cuoc_hop}}`, `{{ngay_hop}}`, `{{dia_diem}}`, `{{chu_tri}}`, `{{thanh_phan}}`, `{{nguoi_lap}}`, "
-            "`{{tom_tat_chung}}`, `{{noi_dung_thao_luan}}`, `{{ket_luan_chi_dao}}`, `{{ke_hoach_hanh_dong}}`."
+            "`{{tom_tat_chung}}`, `{{noi_dung_thao_luan}}`, `{{ket_luan_chi_dao}}`, `{{ke_hoach_hanh_dong}}` (và bảng lặp `action_items`)."
         )
 
     c1, c2, c3 = st.columns(3)
@@ -650,7 +788,13 @@ with tab3:
         nguoi_lap = st.text_input("Người lập biên bản:", value="")
         thanh_phan = st.text_input("Thành phần tham dự:", value="Các bộ phận liên quan")
 
-    uploaded_docx = st.file_uploader("📂 Tải lên File Word Form Mẫu của đơn vị (.docx):", type=["docx"])
+    uploaded_docx = st.file_uploader("📂 Tải lên File Word Biên Bản Mẫu (.docx) của đơn vị:", type=["docx"])
+
+    # Hiển thị bản xem trước dữ liệu từ Bước 2 sẽ đưa vào Word
+    with st.expander("👁️ Xem trước dữ liệu Recap từ Bước 2 sẽ điền vào Biên bản Word", expanded=True):
+        st.markdown(f"- **Tóm tắt chung:** {st.session_state.recap_data.get('tom_tat_chung') or '*(Chưa có dữ liệu từ Bước 2)*'}")
+        st.markdown(f"- **Nội dung thảo luận:** {st.session_state.recap_data.get('noi_dung_thao_luan') or '*(Chưa có dữ liệu từ Bước 2)*'}")
+        st.markdown(f"- **Kết luận chỉ đạo:** {st.session_state.recap_data.get('ket_luan_chi_dao') or '*(Chưa có dữ liệu từ Bước 2)*'}")
 
     if st.button("🖨️ Kết Xuất Biên Bản Word Hoàn Chỉnh Để Trình Ký", type="primary", use_container_width=True):
         try:
@@ -694,39 +838,37 @@ with tab3:
                 type="primary",
                 use_container_width=True
             )
-            st.success("✅ Đã tạo biên bản thành công!")
+            st.success("✅ Đã tạo biên bản thành công từ nội dung Recap Mục 2!")
         except Exception as e:
             st.error(f"Lỗi khi xuất file Word: {e}")
 
 # ----------------- TAB 4: QUẢN TRỊ & HIỆU ĐÍNH TRỰC TIẾP KHO CHUNG -----------------
 with tab4:
     st.subheader("📚 Quản Trị & Hiệu Đính Trực Tiếp Kho Dữ Liệu Dùng Chung (Google Sheets)")
-    st.caption("Mọi chỉnh sửa tại đây sẽ đồng bộ 2 chiều theo đúng chuẩn `save_glossary` và `upsert_tm` với phần mềm dịch tài liệu của anh.")
-
     col_g, col_tm = st.columns(2)
     
     with col_g:
         st.markdown(f"**📖 Bảng Thuật Ngữ Chung (`Glossary`: {len(st.session_state.glossary)} từ)**")
-        g_list = [{"Tu_Goc": k, "Tu_Dich": v} for k, v in st.session_state.glossary.items()]
-        if not g_list:
-            g_list = [{"Tu_Goc": "", "Tu_Dich": ""}]
-        
+        g_list = [{"Tu_Goc": k, "Tu_Dich": v} for k, v in st.session_state.glossary.items()] or [{"Tu_Goc": "", "Tu_Dich": ""}]
         edited_g = st.data_editor(g_list, num_rows="dynamic", use_container_width=True, height=340, key="editor_glossary")
         
         if st.button("💾 Lưu toàn bộ Bảng Thuật Ngữ lên Sheets (`save_glossary`)", use_container_width=True):
             new_g_dict = {row["Tu_Goc"].strip(): row["Tu_Dich"].strip() for row in edited_g if row.get("Tu_Goc") and row.get("Tu_Dich")}
             ok, msg = save_full_glossary_to_sheets(webapp_url, new_g_dict)
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
 
     with col_tm:
         st.markdown(f"**🧠 Bộ Nhớ Đệm Dịch Thuật Chung (`TM`: {len(st.session_state.tm)} câu)**")
-        tm_list = [{"Khoa_Goc": k, "Ban_Dich_Chuan": v} for k, v in st.session_state.tm.items()]
-        if not tm_list:
-            tm_list = [{"Khoa_Goc": "", "Ban_Dich_Chuan": ""}]
-            
+        tm_list = [{"Khoa_Goc": k, "Ban_Dich_Chuan": v} for k, v in st.session_state.tm.items()] or [{"Khoa_Goc": "", "Ban_Dich_Chuan": ""}]
         edited_tm = st.data_editor(tm_list, num_rows="dynamic", use_container_width=True, height=340, key="editor_tm")
         
         if st.button("💾 Cập nhật các câu đã sửa lên Sheets (`upsert_tm`)", use_container_width=True):
             new_tm_dict = {row["Khoa_Goc"].strip(): row["Ban_Dich_Chuan"].strip() for row in edited_tm if row.get("Khoa_Goc") and row.get("Ban_Dich_Chuan")}
             ok, msg = upsert_tm_to_sheets(webapp_url, new_tm_dict)
-            st.success(msg) if ok else st.error(msg)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
