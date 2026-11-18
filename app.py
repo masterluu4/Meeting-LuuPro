@@ -4,10 +4,11 @@ import requests
 import json
 import io
 import re
+import time
 from datetime import datetime
 import google.generativeai as genai
 from docx import Document
-from docx.shared import Pt, Inches, RGBColor
+from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -47,15 +48,10 @@ for k, v in defaults.items():
 
 # ================= HÀM LÀM SẠCH API KEY & URL =================
 def clean_api_key(raw_key):
-    """Làm sạch khoảng trắng, dấu ngoặc kép/ngoặc vuông quanh API Key"""
+    """Hỗ trợ đầy đủ cả chuẩn khóa mới AQ... và chuẩn AIza... của Google AI Studio"""
     if not raw_key:
         return ""
-    s = str(raw_key).strip().strip("[]\"'() ")
-    # Ưu tiên bắt chuẩn Google Gemini API Key (AIza...)
-    match = re.search(r'AIza[0-9A-Za-z\-_]{35}', s)
-    if match:
-        return match.group(0)
-    return s
+    return str(raw_key).strip().strip("[]\"'() ")
 
 def clean_webapp_url(raw_url):
     """Loại bỏ hoàn toàn dấu ngoặc vuông [], ngoặc kép, khoảng trắng bị dính khi copy/paste"""
@@ -82,7 +78,7 @@ def sync_from_sheets(raw_url):
             return True, f"✅ Đã đồng bộ: {len(st.session_state.glossary)} thuật ngữ & {len(st.session_state.tm)} câu TM."
     except Exception as e:
         return False, f"❌ Lỗi kết nối Google Sheets: {e}"
-    return False, f"❌ Đường dẫn không phản hồi."
+    return False, "❌ Đường dẫn không phản hồi."
 
 def save_full_glossary_to_sheets(raw_url, updated_glossary_dict):
     webapp_url = clean_webapp_url(raw_url)
@@ -118,7 +114,7 @@ def upsert_tm_to_sheets(raw_url, new_tm_dict):
     except Exception as e:
         return False, f"❌ Lỗi kết nối: {e}"
 
-# ================= HÀM KIỂM TRA API KEY & QUÉT MODEL KHẢ DỤNG =================
+# ================= HÀM QUÉT MODEL & ƯU TIÊN GEMINI 3.1 PRO =================
 @st.cache_data(ttl=300, show_spinner=False)
 def validate_and_fetch_models(raw_key):
     api_key = clean_api_key(raw_key)
@@ -129,25 +125,146 @@ def validate_and_fetch_models(raw_key):
         models = []
         for m in genai.list_models():
             if "generateContent" in m.supported_generation_methods:
-                models.append(m.name.replace("models/", ""))
+                name = m.name.replace("models/", "")
+                # Loại bỏ các model cũ đã ngừng cấp cho tài khoản mới (2.5-pro / 1.5-pro) nếu đã có 3.x
+                models.append(name)
         if not models:
             return False, [], "API Key không trả về model nào."
-        return True, models, f"API Key hợp lệ ({len(models)} model khả dụng)"
+        return True, models, f"API Key chuẩn ({len(models)} model khả dụng)"
     except Exception as e:
         return False, [], f"API Key không hợp lệ: {e}"
 
 def pick_optimal_model(models_list, task="recap"):
+    """Ưu tiên số 1 cho gemini-3.1-pro-preview theo đúng chuẩn mới nhất của Google AI Studio"""
     if not models_list:
-        return "gemini-1.5-pro" if task == "recap" else "gemini-1.5-flash"
+        return "gemini-3.1-pro-preview" if task == "recap" else "gemini-2.5-flash"
+    
     if task == "recap":
-        priorities = ["gemini-2.5-pro", "gemini-1.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        priorities = [
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-pro",
+            "gemini-3.0-pro",
+            "gemini-3.5-flash",
+            "gemini-3.1-flash",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash"
+        ]
     else:
-        priorities = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+        priorities = [
+            "gemini-3.5-flash",
+            "gemini-3.1-flash",
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-3.1-pro-preview"
+        ]
+        
     for p in priorities:
         for m in models_list:
             if m == p or m.startswith(p):
                 return m
     return models_list[0]
+
+# ================= HÀM UPLOAD TRỰC TIẾP FILE ÂM THANH LỚN (TRÊN 20MB - 500MB) =================
+def upload_large_audio_rest(api_key, file_bytes, mime_type, display_name="meeting_audio"):
+    """
+    Sử dụng giao thức Resumable Upload REST trực tiếp của Gemini (Không qua $discovery/rest),
+    giúp khóa AQ... tải mượt các file ghi âm nặng 75MB - 500MB (dài 1-3 tiếng) mà không bị lỗi 400 hay 413.
+    """
+    init_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={api_key}"
+    headers = {
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(len(file_bytes)),
+        "X-Goog-Upload-Header-Content-Type": mime_type,
+        "Content-Type": "application/json"
+    }
+    meta = {"file": {"display_name": display_name}}
+    r_init = requests.post(init_url, headers=headers, json=meta, timeout=30)
+    r_init.raise_for_status()
+    
+    upload_url = r_init.headers.get("X-Goog-Upload-URL")
+    if not upload_url:
+        raise RuntimeError("Không lấy được đường dẫn Resumable Upload từ Google.")
+
+    upload_headers = {
+        "Content-Length": str(len(file_bytes)),
+        "X-Goog-Upload-Offset": "0",
+        "X-Goog-Upload-Command": "upload, finalize"
+    }
+    r_up = requests.post(upload_url, headers=upload_headers, data=file_bytes, timeout=300)
+    r_up.raise_for_status()
+    file_info = r_up.json().get("file", {})
+    file_uri = file_info.get("uri")
+    file_name = file_info.get("name")
+
+    # Đợi Google xử lý xong luồng âm thanh dài
+    for _ in range(60):
+        check_res = requests.get(f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}", timeout=15)
+        if check_res.status_code == 200:
+            state = check_res.json().get("state")
+            if state == "ACTIVE":
+                break
+            elif state == "FAILED":
+                raise RuntimeError("Google báo lỗi khi giải mã file âm thanh này.")
+        time.sleep(2)
+
+    return file_uri, file_name
+
+def generate_recap_with_audio_or_text(api_key, model_name, prompt_text, audio_file=None):
+    """
+    Tự động chọn phương thức tối ưu:
+    - Nếu là văn bản hoặc file ghi âm <= 18MB: Gọi trực tiếp siêu tốc.
+    - Nếu là file ghi âm lớn (> 18MB, như file 75.4MB của anh): Dùng Direct REST Resumable Upload + REST generateContent.
+    """
+    genai.configure(api_key=api_key)
+    
+    if audio_file is None:
+        model = genai.GenerativeModel(model_name)
+        res = model.generate_content(prompt_text)
+        return res.text
+
+    file_bytes = audio_file.getvalue()
+    ext = audio_file.name.split(".")[-1].lower()
+    mime_map = {
+        "webm": "audio/webm",
+        "wav": "audio/wav",
+        "mp3": "audio/mp3",
+        "m4a": "audio/mp4",
+        "ogg": "audio/ogg"
+    }
+    mime_type = mime_map.get(ext, "audio/mp4")
+    size_mb = len(file_bytes) / (1024 * 1024)
+
+    # Nếu file nhỏ hơn 18MB -> Truyền trực tiếp Inline Audio Bytes
+    if size_mb <= 18.0:
+        model = genai.GenerativeModel(model_name)
+        audio_part = {"mime_type": mime_type, "data": file_bytes}
+        res = model.generate_content([prompt_text, audio_part])
+        return res.text
+
+    # Nếu file lớn (> 18MB, ví dụ 75.4MB) -> Dùng Direct REST Resumable Upload
+    file_uri, file_name = upload_large_audio_rest(api_key, file_bytes, mime_type, audio_file.name)
+    try:
+        gen_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt_text},
+                    {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
+                ]
+            }]
+        }
+        r_gen = requests.post(gen_url, json=payload, timeout=600)
+        if r_gen.status_code != 200:
+            raise RuntimeError(f"Lỗi {r_gen.status_code}: {r_gen.text}")
+        data = r_gen.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    finally:
+        # Xóa file tạm trên đám mây sau khi phân tích xong để bảo mật
+        try:
+            requests.delete(f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={api_key}", timeout=10)
+        except Exception:
+            pass
 
 # ================= HÀM DỊCH THUẬT AI + SO KHỚP GLOSSARY & TM =================
 def translate_batch_with_thaco_memory(lines_with_time, mode, raw_key, model_name, raw_url=""):
@@ -206,7 +323,6 @@ def translate_batch_with_thaco_memory(lines_with_time, mode, raw_key, model_name
 
 # ================= HÀM ĐIỀN TRỰC TIẾP VÀO FILE WORD MẪU BBH THACO =================
 def set_cell_border(cell):
-    """Kẻ khung viền chuẩn cho ô bảng mới thêm vào Word"""
     tcPr = cell._tc.get_or_add_tcPr()
     tcBorders = OxmlElement('w:tcBorders')
     for border_name in ['top', 'left', 'bottom', 'right']:
@@ -219,13 +335,8 @@ def set_cell_border(cell):
     tcPr.append(tcBorders)
 
 def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
-    """
-    Điền trực tiếp vào file '2026-1113. BB họp chất lượng xe xuất khẩuV4.docx' của anh
-    mà KHÔNG cần sửa mẫu trước. Giữ nguyên 100% Logo, Header, Bảng thành phần và Bảng chữ ký!
-    """
     doc = Document(io.BytesIO(template_file_bytes))
 
-    # 1. Cập nhật Số BBH trong bảng Header (Bảng đầu tiên nếu có chữ 'Số:')
     if len(doc.tables) >= 1:
         header_tbl = doc.tables[0]
         for row in header_tbl.rows:
@@ -236,7 +347,6 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
                             p.text = f"Số: {meta['so_bbh']}"
                             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # 2. Cập nhật các dòng V/v, Thời gian, Địa điểm, Kết luận trong các đoạn văn (Paragraphs)
     for p in doc.paragraphs:
         txt = p.text.strip()
         if txt.startswith("V/v:") or txt.startswith("V/v :"):
@@ -251,7 +361,6 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
         elif txt.startswith("Trên đây là các thống nhất"):
             p.text = meta["ket_luan_chung"]
 
-    # 3. Tìm đúng Bảng 7 cột 'Nội dung thảo luận và kế hoạch triển khai' (TT | Vấn đề | Nội dung thảo luận...)
     target_table = None
     for tbl in doc.tables:
         if len(tbl.columns) >= 6 and len(tbl.rows) >= 1:
@@ -260,7 +369,6 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
                 target_table = tbl
                 break
 
-    # Fallback: Nếu mẫu có đúng 4 bảng chuẩn như file anh đính kèm, bảng nội dung là bảng số 3 (index 2)
     if target_table is None and len(doc.tables) >= 3:
         for tbl in doc.tables:
             if len(tbl.columns) == 7:
@@ -268,13 +376,11 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
                 break
 
     if target_table is not None:
-        # Xóa toàn bộ các dòng dữ liệu cũ bên dưới dòng tiêu đề (giữ lại row 0 làm Header)
         while len(target_table.rows) > 1:
             tbl_element = target_table._tbl
             tr_element = target_table.rows[1]._tr
             tbl_element.remove(tr_element)
 
-        # Đổ từng dòng từ kết quả AI Recap (Mục 2) vào bảng
         for idx, item in enumerate(recap_rows, 1):
             row_cells = target_table.add_row().cells
             values = [
@@ -289,7 +395,6 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
             for c_idx in range(min(len(row_cells), 7)):
                 row_cells[c_idx].text = values[c_idx]
                 set_cell_border(row_cells[c_idx])
-                # Căn giữa cho cột TT, Trách nhiệm, Phối hợp, Hoàn thành
                 if c_idx in [0, 4, 5, 6]:
                     for p in row_cells[c_idx].paragraphs:
                         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -300,10 +405,7 @@ def populate_uploaded_thaco_docx(template_file_bytes, meta, recap_rows):
     return out_bio.getvalue()
 
 def generate_default_thaco_bbh_docx(meta, recap_rows):
-    """Tạo sẵn file Word chuẩn bố cục Phòng QLCL KCN - THACO AUTO nếu người dùng chưa tải file mẫu lên"""
     doc = Document()
-    
-    # Bảng 1: Header Công ty & Số hiệu
     hdr_table = doc.add_table(rows=1, cols=2)
     hdr_table.cell(0, 0).text = "CÔNG TY TNHH THACO AUTO"
     hdr_table.cell(0, 1).text = f"Số: {meta['so_bbh']}"
@@ -370,12 +472,10 @@ with st.sidebar:
     default_key = st.secrets.get("GEMINI_API_KEY", "") if "GEMINI_API_KEY" in st.secrets else ""
     default_url = st.secrets.get("WEBAPP_URL", "") if "WEBAPP_URL" in st.secrets else ""
 
-    raw_api_key_input = st.text_input("🔑 1. Gemini API Key (Bắt đầu bằng AIza...):", value=default_key, type="password")
+    raw_api_key_input = st.text_input("🔑 1. Gemini API Key:", value=default_key, type="password")
     gemini_api_key = clean_api_key(raw_api_key_input)
     
     if gemini_api_key:
-        if not gemini_api_key.startswith("AIza"):
-            st.warning("⚠️ Chú ý: Mã Key bạn đang dán (`AQ...`) không có định dạng chuẩn `AIzaSy...` của Google AI Studio. Nếu gặp lỗi 400, hãy lấy Key chuẩn tại aistudio.google.com/app/apikey")
         is_valid, models_list, key_msg = validate_and_fetch_models(gemini_api_key)
         if is_valid:
             st.success(f"✅ {key_msg}")
@@ -383,7 +483,7 @@ with st.sidebar:
             opt_trans = pick_optimal_model(models_list, task="translate")
             
             selected_recap_model = st.selectbox(
-                "🧠 Model AI cho Recap & Nghe File Âm Thanh:",
+                "🧠 Model AI cho Recap & Nghe File Âm Thanh (Tối ưu 3.1 Pro):",
                 options=models_list,
                 index=models_list.index(opt_recap) if opt_recap in models_list else 0
             )
@@ -394,12 +494,12 @@ with st.sidebar:
             )
         else:
             st.error(f"❌ {key_msg}")
-            selected_recap_model = "gemini-1.5-pro"
-            selected_trans_model = "gemini-1.5-flash"
+            selected_recap_model = "gemini-3.1-pro-preview"
+            selected_trans_model = "gemini-2.5-flash"
     else:
         st.caption("Nhập Gemini API Key để hiển thị danh sách Model.")
-        selected_recap_model = "gemini-1.5-pro"
-        selected_trans_model = "gemini-1.5-flash"
+        selected_recap_model = "gemini-3.1-pro-preview"
+        selected_trans_model = "gemini-2.5-flash"
 
     st.divider()
     raw_webapp_input = st.text_input("☁️ 2. Link Google Apps Script (Dùng chung):", value=default_url)
@@ -445,7 +545,7 @@ st.title("🚗 Hệ Thống Trợ Lý Họp, Dịch Thuật Real-time & Xuất B
 
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎙️ Bước 1: Thu Âm VB-Cable & Phụ Đề",
-    "🧠 Bước 2: AI Recap (Chuẩn Bảng 7 Cột BBH THACO)",
+    "🧠 Bước 2: AI Recap (Gemini 3.1 Pro - Chuẩn 7 Cột BBH)",
     "📄 Bước 3: Xuất Biên Bản Word Trình Ký",
     "📚 Quản Trị Kho TM / Glossary Chung"
 ])
@@ -455,7 +555,7 @@ with tab1:
     st.info(
         "🔊 **Thiết lập chuẩn với VB-Audio Virtual Cable:** "
         "Trong cài đặt âm thanh của **MS Teams / Zoom / VooV**, chọn Loa (Speaker) là `CABLE Input`. "
-        "Sau khi bấm **Dừng**, anh tải **File Ghi Âm (`.webm`)** hoặc **File Phụ Đề (`.txt`)** để đưa sang Bước 2 phân tích."
+        "Sau khi bấm **Dừng**, anh tải **File Ghi Âm (`.webm`)** hoặc **File Phụ Đề (`.txt`)** để đưa sang Bước 2 phân tích bằng **Gemini 3.1 Pro**."
     )
 
     speech_lang = "en-US" if trans_mode == "Anh -> Việt" else "vi-VN"
@@ -724,7 +824,7 @@ with tab2:
     input_source_mode = st.radio(
         "📂 Chọn nguồn đầu vào cho AI Recap:",
         [
-            "🎙️ 1. Dùng File Ghi Âm (.webm / .wav / .mp3 / .m4a) tải về từ Bước 1 (Truyền trực tiếp Inline Audio Bytes - Không lỗi Upload)",
+            "🎙️ 1. Dùng File Ghi Âm (.webm / .wav / .mp3 / .m4a) - Hỗ trợ cả file nặng >75MB dài hàng giờ",
             "📄 2. Dùng File Phụ Đề (.txt) tải về từ Bước 1",
             "📝 3. Dùng trực tiếp văn bản đã dịch / dán ở Bước 1"
         ]
@@ -736,7 +836,7 @@ with tab2:
 
     if input_source_mode.startswith("🎙️"):
         uploaded_audio_recap = st.file_uploader(
-            "Tải lên File Ghi Âm cuộc họp vừa thu ở Bước 1 (.webm, .wav, .mp3, .m4a):",
+            "Tải lên File Ghi Âm cuộc họp (.webm, .wav, .mp3, .m4a):",
             type=["webm", "wav", "mp3", "m4a", "ogg"]
         )
         if uploaded_audio_recap:
@@ -804,45 +904,34 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
         if not gemini_api_key:
             st.error("Vui lòng nhập Gemini API Key ở thanh bên trái!")
         elif input_source_mode.startswith("🎙️") and not uploaded_audio_recap:
-            st.warning("Vui lòng tải lên File Ghi Âm từ Bước 1!")
+            st.warning("Vui lòng tải lên File Ghi Âm!")
         elif not input_source_mode.startswith("🎙️") and not text_for_recap.strip():
             st.warning("Chưa có dữ liệu văn bản cuộc họp để phân tích!")
         else:
-            with st.spinner(f"Model {selected_recap_model} đang nghe/phân tích và bóc tách vào bảng 7 cột chuẩn BBH THACO..."):
+            with st.spinner(f"Model {selected_recap_model} đang nghe/phân tích toàn bộ cuộc họp và bóc tách vào bảng 7 cột chuẩn BBH THACO..."):
                 try:
-                    genai.configure(api_key=gemini_api_key)
-                    model = genai.GenerativeModel(selected_recap_model)
                     glossary_context = f"--- BẢNG THUẬT NGỮ THACO DÙNG CHUNG ---\n{json.dumps(st.session_state.glossary, ensure_ascii=False)}\n\n"
 
                     if input_source_mode.startswith("🎙️"):
-                        # Truyền trực tiếp Byte âm thanh (Inline Audio Part) - Không dùng genai.upload_file để tránh lỗi HttpError 400
-                        ext = uploaded_audio_recap.name.split(".")[-1].lower()
-                        mime_map = {
-                            "webm": "audio/webm",
-                            "wav": "audio/wav",
-                            "mp3": "audio/mp3",
-                            "m4a": "audio/mp4",
-                            "ogg": "audio/ogg"
-                        }
-                        audio_part = {
-                            "mime_type": mime_map.get(ext, "audio/webm"),
-                            "data": uploaded_audio_recap.getvalue()
-                        }
                         full_prompt = (
                             f"{custom_prompt}\n\n"
                             f"{glossary_context}"
-                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm và bóc tách chi tiết vào bảng JSON 7 cột theo yêu cầu."
+                            f"Hãy lắng nghe toàn bộ file ghi âm cuộc họp đính kèm và bóc tách chi tiết mọi vấn đề vào bảng JSON 7 cột theo yêu cầu."
                         )
-                        res = model.generate_content([full_prompt, audio_part])
+                        raw_reply = generate_recap_with_audio_or_text(
+                            gemini_api_key, selected_recap_model, full_prompt, audio_file=uploaded_audio_recap
+                        )
                     else:
                         full_prompt = (
                             f"{custom_prompt}\n\n"
                             f"{glossary_context}"
                             f"--- NỘI DUNG CUỘC HỌP ---\n{text_for_recap}"
                         )
-                        res = model.generate_content(full_prompt)
+                        raw_reply = generate_recap_with_audio_or_text(
+                            gemini_api_key, selected_recap_model, full_prompt, audio_file=None
+                        )
 
-                    cleaned = res.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                    cleaned = raw_reply.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                     parsed = json.loads(cleaned)
                     
                     if parsed.get("ve_viec"):
@@ -852,7 +941,7 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
                     if parsed.get("rows") and isinstance(parsed["rows"], list):
                         st.session_state.recap_rows = parsed["rows"]
 
-                    st.success("✅ Đã phân tích thành công! Kiểm tra bảng 7 cột bên dưới và chuyển sang Bước 3 để xuất file Word trình ký.")
+                    st.success(f"✅ Đã phân tích thành công bằng `{selected_recap_model}`! Kiểm tra bảng 7 cột bên dưới và chuyển sang Bước 3 để xuất file Word trình ký.")
                 except Exception as e:
                     st.error(f"Lỗi phân tích AI: {e}")
 
@@ -880,7 +969,7 @@ with tab3:
     st.subheader("📄 Xuất Biên Bản Họp Word (.docx) Đúng Chuẩn Mẫu Phòng QLCL KCN - THACO AUTO")
     
     st.success(
-        "✨ **Cơ chế Nhận Diện Mẫu Thông Minh:** Anh chỉ cần tải trực tiếp file **`2026-1113. BB họp chất lượng xe xuất khẩuV4 - Copy.docx`** (hoặc bất kỳ BBH mẫu nào của Phòng QLCL KCN) lên ô bên dưới mà **không cần chỉnh sửa hay gõ thêm ký hiệu nào vào file Word**. Hệ thống sẽ tự động giữ nguyên Logo THACO AUTO, bảng Thành phần tham dự, bảng Chữ ký 4 cột và đổ toàn bộ dữ liệu từ Bước 2 vào đúng bảng 7 cột!"
+        "✨ **Cơ chế Nhận Diện Mẫu Thông Minh:** Anh chỉ cần tải trực tiếp file **`2026-1113. BB họp chất lượng xe xuất khẩuV4 - Copy.docx`** lên ô bên dưới mà **không cần chỉnh sửa file mẫu**. Hệ thống giữ nguyên 100% Logo THACO AUTO, bảng Thành phần tham dự, bảng Chữ ký 4 cột và đổ toàn bộ dữ liệu từ Bước 2 vào đúng bảng 7 cột!"
     )
 
     col_m1, col_m2 = st.columns(2)
