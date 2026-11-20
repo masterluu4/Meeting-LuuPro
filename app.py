@@ -1265,7 +1265,15 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
 
                     cleaned = raw_reply.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                     parsed = json.loads(cleaned)
+                    if not raw_reply or not raw_reply.strip():
+                        raise ValueError("AI trả về nội dung trống (có thể file ghi âm quá dài hoặc model đang quá tải). Hãy thử đổi sang model 'gemini-2.5-flash'.")
+
+                    # Tự động tìm và cắt lấy đúng khối JSON từ dấu { đầu tiên đến dấu } cuối cùng
+                    json_match = re.search(r'\{[\s\S]*\}', raw_reply)
+                    if not json_match:
+                        raise ValueError(f"AI không trả về đúng định dạng JSON. Nội dung nhận được: {raw_reply[:300]}...")
                     
+                    parsed = json.loads(json_match.group(0))
                     if parsed.get("ve_viec"):
                         st.session_state.bbh_meta["ve_viec"] = parsed["ve_viec"]
                     if parsed.get("ket_luan_chung"):
