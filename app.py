@@ -426,7 +426,11 @@ def generate_recap_with_audio_or_text(api_key, model_name, prompt_text, audio_fi
                     {"text": prompt_text},
                     {"file_data": {"mime_type": mime_type, "file_uri": file_uri}}
                 ]
-            }]
+            }],
+            "generationConfig": {
+                "response_mime_type": "application/json",
+                "temperature": 0.2
+            }
         }
         last_error_text = ""
         for m_name in candidate_models:
