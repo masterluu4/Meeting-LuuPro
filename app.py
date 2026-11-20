@@ -1263,25 +1263,58 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
                             gemini_api_key, selected_recap_model, full_prompt, audio_file=None
                         )
 
+if not raw_reply or not raw_reply.strip():
+                        raise ValueError("AI trả về phản hồi trống. Hãy kiểm tra lại âm thanh trong file ghi âm.")
+
+                    st.session_state.last_ai_raw_reply = raw_reply
+
                     cleaned = raw_reply.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-                    parsed = json.loads(cleaned)
-                    if not raw_reply or not raw_reply.strip():
-                        raise ValueError("AI trả về nội dung trống (có thể file ghi âm quá dài hoặc model đang quá tải). Hãy thử đổi sang model 'gemini-2.5-flash'.")
-
-                    # Tự động tìm và cắt lấy đúng khối JSON từ dấu { đầu tiên đến dấu } cuối cùng
-                    json_match = re.search(r'\{[\s\S]*\}', raw_reply)
+                    json_match = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', cleaned)
                     if not json_match:
-                        raise ValueError(f"AI không trả về đúng định dạng JSON. Nội dung nhận được: {raw_reply[:300]}...")
-                    
-                    parsed = json.loads(json_match.group(0))
-                    if parsed.get("ve_viec"):
-                        st.session_state.bbh_meta["ve_viec"] = parsed["ve_viec"]
-                    if parsed.get("ket_luan_chung"):
-                        st.session_state.bbh_meta["ket_luan_chung"] = parsed["ket_luan_chung"]
-                    if parsed.get("rows") and isinstance(parsed["rows"], list):
-                        st.session_state.recap_rows = parsed["rows"]
+                        raise ValueError(f"AI không trả về đúng định dạng JSON. Nội dung AI trả về:\n{raw_reply[:500]}")
 
-                    st.success("✅ Đã tổng hợp xong! Anh kiểm tra bảng kết quả bên dưới rồi bấm sang Bước 3 để tải file Word.")
+                    parsed = json.loads(json_match.group(0))
+
+                    if isinstance(parsed, dict):
+                        if parsed.get("ve_viec"):
+                            st.session_state.bbh_meta["ve_viec"] = str(parsed["ve_viec"])
+                        if parsed.get("ket_luan_chung"):
+                            st.session_state.bbh_meta["ket_luan_chung"] = str(parsed["ket_luan_chung"])
+
+                    raw_list = []
+                    if isinstance(parsed, list):
+                        raw_list = parsed
+                    elif isinstance(parsed, dict):
+                        for candidate_key in ["rows", "data", "items", "noi_dung", "table", "content", "ke_hoach"]:
+                            if isinstance(parsed.get(candidate_key), list):
+                                raw_list = parsed[candidate_key]
+                                break
+                        if not raw_list:
+                            for v in parsed.values():
+                                if isinstance(v, list) and len(v) > 0:
+                                    raw_list = v
+                                    break
+
+                    normalized_rows = []
+                    for idx, item in enumerate(raw_list, 1):
+                        if not isinstance(item, dict):
+                            continue
+                        normalized_rows.append({
+                            "tt": str(item.get("tt") or item.get("TT") or idx),
+                            "van_de": str(item.get("van_de") or item.get("Vấn đề") or item.get("vanDe") or ""),
+                            "noi_dung_thao_luan": str(item.get("noi_dung_thao_luan") or item.get("Nội dung thảo luận") or item.get("noiDung") or ""),
+                            "cong_viec_tiep_theo": str(item.get("cong_viec_tiep_theo") or item.get("Công việc thực hiện tiếp theo") or item.get("congViec") or ""),
+                            "trach_nhiem": str(item.get("trach_nhiem") or item.get("T.nhiệm") or item.get("Trách nhiệm") or ""),
+                            "phoi_hop": str(item.get("phoi_hop") or item.get("P.hợp") or item.get("Phối hợp") or "-"),
+                            "hoan_thanh": str(item.get("hoan_thanh") or item.get("H.thành") or item.get("Hoàn thành") or "")
+                        })
+
+                    if normalized_rows:
+                        st.session_state.recap_rows = normalized_rows
+                        st.success(f"✅ Đã tổng hợp xong {len(normalized_rows)} nội dung! Anh kiểm tra bảng bên dưới rồi sang Bước 3 tải file Word.")
+                    else:
+                        st.warning("⚠️ AI đã chạy xong nhưng không bóc tách được dòng nội dung nào. Xem chi tiết phản hồi thô của AI bên dưới:")
+                        st.code(raw_reply, language="json")
                 except Exception as e:
                     st.error(f"Lỗi phân tích AI: {e}")
 
