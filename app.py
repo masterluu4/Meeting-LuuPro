@@ -1263,7 +1263,7 @@ Chỉ trả về đúng chuỗi JSON hợp lệ, không thêm ký tự markdown.
                             gemini_api_key, selected_recap_model, full_prompt, audio_file=None
                         )
 
-if not raw_reply or not raw_reply.strip():
+                    if not raw_reply or not raw_reply.strip():
                         raise ValueError("AI trả về phản hồi trống. Hãy kiểm tra lại âm thanh trong file ghi âm.")
 
                     st.session_state.last_ai_raw_reply = raw_reply
@@ -1315,6 +1315,7 @@ if not raw_reply or not raw_reply.strip():
                     else:
                         st.warning("⚠️ AI đã chạy xong nhưng không bóc tách được dòng nội dung nào. Xem chi tiết phản hồi thô của AI bên dưới:")
                         st.code(raw_reply, language="json")
+
                 except Exception as e:
                     st.error(f"Lỗi phân tích AI: {e}")
 
